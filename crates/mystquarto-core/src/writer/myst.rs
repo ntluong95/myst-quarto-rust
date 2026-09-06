@@ -60,11 +60,17 @@ impl<'a> MystWriter<'a> {
 
     /// Frontmatter is mapped field-by-field via
     /// [`crate::frontmatter::quarto_to_myst`] (reference §8.4) —
-    /// `jupyter`/`engine` -> `kernelspec`, `format` -> `exports`, etc.
-    /// Applying this unconditionally is correct for this writer's only
-    /// current caller ([`crate::pipeline::convert_quarto_to_myst_batch`],
-    /// always Quarto-sourced); for a same-dialect MyST->MyST round trip
-    /// (this writer's other documented use, see this module's docs) it is a
+    /// `jupyter`/`engine` -> `kernelspec`, `format` -> `exports`, etc. `doc`'s
+    /// own `engine` (detected from the body by
+    /// [`crate::reader::quarto`]'s `detect_engine` — an `{r}` code-cell
+    /// implies knitr even with no `engine:`/`jupyter:` field to read) is
+    /// passed through so a page relying on Quarto's implicit engine
+    /// detection still gets a kernelspec rather than silently losing its
+    /// executability. Applying this unconditionally is correct for this
+    /// writer's only current caller
+    /// ([`crate::pipeline::convert_quarto_to_myst_batch`], always
+    /// Quarto-sourced); for a same-dialect MyST->MyST round trip (this
+    /// writer's other documented use, see this module's docs) it is a
     /// no-op, since a genuine MyST source document has no `jupyter`/`format`/
     /// `engine`/`crossref.eq-prefix` keys for it to touch.
     #[must_use]
@@ -75,7 +81,7 @@ impl<'a> MystWriter<'a> {
         let mut out = String::new();
         let mut warnings = Vec::new();
         if let Some(fm) = &doc.frontmatter {
-            let (mapped, fm_warnings) = crate::frontmatter::quarto_to_myst(fm);
+            let (mapped, fm_warnings) = crate::frontmatter::quarto_to_myst(fm, doc.engine);
             warnings = fm_warnings;
             out.push_str("---\n");
             out.push_str(&mapped);

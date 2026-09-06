@@ -84,6 +84,9 @@ the rest of `mappings.toml` is tracked, not done, in
 | MQ0409 | Warning | A root-level `_quarto.yml` key has no myst.yml equivalent at all (`execute:`, `csl:`, `theme:`, …); dropped. | No myst.yml target exists for this key; reproduce the setting via a different mechanism if needed. |
 | MQ0410 | LossyExpected | A page-frontmatter field has no correct target in the other dialect (`label`, `math`); dropped rather than mismapped. | `label` isn't a cross-reference target in this tool's model, so nothing regresses. `math` (LaTeX macros) has no Quarto page-level equivalent. |
 | MQ0411 | Warning | `myst.yml` set both `banner` and `thumbnail`; `_quarto.yml` has one `image:` slot, so `banner` was used. | Remove whichever of the two isn't wanted in the Quarto output. |
+| MQ0412 | LossyExpected | A page's explicit `engine: knitr` was mapped to `kernelspec: {name: ir}` — MyST has no knitr engine, only Jupyter kernels. | The document needs an R execution setup Quarto's native knitr didn't: an installed+registered IRkernel, MyST's `jupyter_kernel_gateway` (a plain `jupyter server` install is not enough), and `--execute` on `myst build`/`myst start` (off by default) — the full checklist is in the diagnostic message. |
+| MQ0413 | LossyExpected | A page has an `{r}` code-cell but no `engine:`/`jupyter:` frontmatter to map — Quarto infers the R engine implicitly from the fence itself; `kernelspec: {name: ir}` was synthesized from the detected code-cell language. | Same setup checklist as MQ0412 to actually execute it. |
+| MQ0414 | Info | A Quarto manuscript's `manuscript.article`/`manuscript.notebooks` were mapped back to myst.yml's `project.toc` (and `project.exports[].article`). | No action — without this the converted MyST project has no toc at all, so MyST falls back to whatever page it discovers first (e.g. `README.md`) as the landing page. |
 
 ## MQ06xx — file, IO, path safety, discovery
 

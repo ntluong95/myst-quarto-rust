@@ -53,6 +53,29 @@ full list of behavior changes.
 list, including colon-label normalization, figure/table label loss,
 literal `%` comments, dropped config fields, and DOI citation-key handling.
 
+Found and fixed since, against a real-world Quarto manuscript conversion:
+
+- `format:` always defaults to `html` first (Quarto's own default render
+  target), with `typst`/`docx`/`pdf` as alternates; `typst` always carries
+  `number-sections: true`, without which Quarto's Typst writer fails outright
+  on any document with a section cross-reference.
+- Quarto→MyST: a manuscript's `manuscript.article`/`manuscript.notebooks`
+  are no longer silently dropped — they're mapped back to myst.yml's
+  `project.toc` and `project.exports[].article` (MQ0414), and
+  `site.template: article-theme` is restored. Previously the converted
+  project had no toc at all, so MyST fell back to whatever page it
+  discovered first (e.g. `README.md`) as the landing page, demoting the
+  actual article to an untracked "supporting document."
+- Quarto→MyST: `format: html` is no longer round-tripped into myst.yml's
+  `exports[]` — it isn't a legal value there and made the converted
+  myst.yml fail MyST's own validation outright.
+- A page with an `{r}` code-cell but no `engine:`/`jupyter:` frontmatter
+  (Quarto infers the engine implicitly from the fence) now gets a
+  synthesized `kernelspec: {name: ir}` (MQ0413) so it stays executable
+  under MyST instead of silently losing its executability.
+- A brand-new output directory (no existing ancestor on disk yet) no longer
+  fails to resolve with "no existing ancestor to canonicalize."
+
 ### Removed
 
 - `src/mystquarto/` (Python source), `tests/*.py`, `tests/conftest.py`,

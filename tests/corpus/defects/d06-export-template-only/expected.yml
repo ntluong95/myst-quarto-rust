@@ -3,4 +3,16 @@ project:
 title: Sample Article
 # mystquarto: `template: lapreprint-typst` is not portable to Quarto; inferred format `typst`
 format:
-  typst: {}
+  html:
+    theme:
+      - default
+    toc: true
+    comments:
+      hypothesis: true
+    number-sections: true
+    citations-hover: true
+    crossrefs-hover: true
+    toc-location: right
+    title-block-style: manuscript
+  typst:
+    number-sections: true

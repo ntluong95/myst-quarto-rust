@@ -53,6 +53,7 @@ const HANDLED_ROOT_KEYS: &[&str] = &[
     "project",
     "book",
     "site",
+    "manuscript",
 ];
 
 /// Converts `quarto_text` (a whole `_quarto.yml` file's contents) to
@@ -70,6 +71,8 @@ pub fn convert(
     let root = parse_mapping(quarto_text)?;
     let project_type = string_field(mapping_field(&root, "project"), "type");
     let is_book = project_type.as_deref() == Some("book") || get(&root, "book").is_some();
+    let is_manuscript =
+        !is_book && (project_type.as_deref() == Some("manuscript") || get(&root, "manuscript").is_some());
 
     let mut warnings = Vec::new();
     let mut project_fields: Vec<(String, YamlValue)> = Vec::new();
@@ -192,12 +195,75 @@ pub fn convert(
         }
     }
 
-    if let Some(format) = get(&root, "format").and_then(as_mapping) {
-        let (exports_field, export_warnings) = format_to_exports(format);
-        warnings.extend(export_warnings);
-        if let Some(e) = exports_field {
-            project_fields.push(("exports".to_string(), e));
+    // A manuscript's `manuscript.article`/`manuscript.notebooks` have no
+    // myst.yml field of their own — the forward direction derives
+    // `manuscript.article` from `project.exports[].article`
+    // (`exports::manuscript_article`) and `manuscript.notebooks` from
+    // `.ipynb` entries in `project.toc`. Restoring both here (rather than
+    // letting them fall into the generic "unrecognized top-level key"
+    // warning below) is what lets the converted MyST project still know
+    // which page is the primary article — without it, MyST has no signal
+    // for which document is the landing page and falls back to whatever it
+    // discovers first (e.g. `README.md`), demoting the real article to an
+    // untracked "supporting document."
+    let mut manuscript_article: Option<String> = None;
+    let mut manuscript_toc: Vec<YamlValue> = Vec::new();
+    if is_manuscript {
+        let manuscript = mapping_field(&root, "manuscript");
+        if let Some(article) = string_field(manuscript, "article") {
+            let myst_name = rewrite_quarto_content_extension(&article);
+            manuscript_toc.push(YamlValue::Mapping(vec![(
+                "file".to_string(),
+                YamlValue::String(myst_name.clone()),
+            )]));
+            manuscript_article = Some(myst_name);
         }
+        for nb in sequence_field(manuscript, "notebooks") {
+            if let Some(file) = notebook_entry_file(nb) {
+                manuscript_toc.push(YamlValue::Mapping(vec![(
+                    "file".to_string(),
+                    YamlValue::String(rewrite_quarto_content_extension(&file)),
+                )]));
+            }
+        }
+        if !manuscript_toc.is_empty() {
+            warnings.push(warn(
+                Severity::Info,
+                codes::MANUSCRIPT_ARTICLE_RESTORED,
+                "_quarto.yml `manuscript.article`/`manuscript.notebooks` were mapped back to \
+                 myst.yml `project.toc` (and `project.exports[].article`) so the converted \
+                 MyST project still knows which page is the primary article (reference §8.1)"
+                    .to_string(),
+            ));
+        }
+    }
+
+    let mut exports_field: Option<YamlValue> = None;
+    if let Some(format) = get(&root, "format").and_then(as_mapping) {
+        let (field, export_warnings) = format_to_exports(format);
+        warnings.extend(export_warnings);
+        exports_field = field;
+    }
+    if let Some(article) = &manuscript_article {
+        match &mut exports_field {
+            Some(YamlValue::Sequence(entries)) if !entries.is_empty() => {
+                if let YamlValue::Mapping(first) = &mut entries[0] {
+                    first.push(("article".to_string(), YamlValue::String(article.clone())));
+                }
+            }
+            _ => {
+                exports_field = Some(YamlValue::Sequence(vec![YamlValue::Mapping(vec![(
+                    "article".to_string(),
+                    YamlValue::String(article.clone()),
+                )])]));
+            }
+        }
+    }
+    if let Some(e) = exports_field {
+        project_fields.push(("exports".to_string(), e));
+    }
+    if !manuscript_toc.is_empty() {
+        project_fields.push(("toc".to_string(), YamlValue::Sequence(manuscript_toc)));
     }
 
     if let Some(eq_prefix) = string_field(mapping_field(&root, "crossref"), "eq-prefix") {
@@ -219,6 +285,11 @@ pub fn convert(
         site_fields.push((
             "template".to_string(),
             YamlValue::String("book-theme".to_string()),
+        ));
+    } else if is_manuscript {
+        site_fields.push((
+            "template".to_string(),
+            YamlValue::String("article-theme".to_string()),
         ));
     }
     if let Some(fields) = preserved_fields {
@@ -263,6 +334,31 @@ pub fn convert(
         is_book,
         warnings,
     })
+}
+
+/// Inverse of the forward direction's `rewrite_content_extension`
+/// (`.md` -> `.qmd`, `.ipynb` unchanged): `.qmd` -> `.md`, `.ipynb`
+/// unchanged, anything else passed through as-is.
+fn rewrite_quarto_content_extension(name: &str) -> String {
+    if name.ends_with(".ipynb") {
+        name.to_string()
+    } else if let Some(stem) = name.strip_suffix(".qmd") {
+        format!("{stem}.md")
+    } else {
+        name.to_string()
+    }
+}
+
+/// Extracts a `manuscript.notebooks[]` entry's file name — either a bare
+/// string or a `{notebook: <path>, ...}` mapping (Quarto also allows
+/// `title:`/`order:` alongside `notebook:`, which this only needs the path
+/// out of).
+fn notebook_entry_file(entry: &YamlValue) -> Option<String> {
+    as_mapping(entry)
+        .and_then(|m| get(m, "notebook"))
+        .and_then(as_str)
+        .or_else(|| as_str(entry))
+        .map(str::to_string)
 }
 
 fn convert_authors_back(authors: &[YamlValue]) -> Vec<YamlValue> {
@@ -336,6 +432,16 @@ pub(crate) fn format_to_exports(
     let mut warnings = Vec::new();
     for (key, _) in format {
         let myst_format = match key.as_str() {
+            // `html` is never a real `exports[].format` value in myst.yml —
+            // MyST's own schema rejects it outright (valid set: `pdf`,
+            // `tex`, `pdf+tex`, `typst`, `docx`, `xml`, `md`, `meca`,
+            // `cff`), confirmed by `myst build`'s own validator. It is the
+            // implicit default output on both sides (the forward direction
+            // always emits `format: {html: {...}}` as Quarto's default —
+            // see `crate::config::exports::html_defaults`), so round
+            // tripping it back into an export entry would corrupt the
+            // output rather than lose information; skip it silently.
+            "html" => continue,
             "pdf" => "pdf",
             "docx" => "docx",
             "latex" => "tex",
@@ -453,6 +559,77 @@ mod tests {
         assert!(result.text.contains("file: a"));
         assert!(result.text.contains("file: b"));
         assert!(result.warnings.iter().any(|w| w.message.contains("part")));
+    }
+
+    #[test]
+    fn manuscript_project_gets_article_theme_not_dropped_silently() {
+        let quarto = "project:\n  type: manuscript\ntitle: X\nmanuscript:\n  article: article.qmd\n  notebooks:\n    - notebook: analysis.ipynb\n";
+        let result = convert(quarto, None).unwrap();
+        assert!(!result.is_book);
+        assert!(
+            result.text.contains("site:\n  template: article-theme\n"),
+            "{}",
+            result.text
+        );
+        assert!(!result
+            .warnings
+            .iter()
+            .any(|w| w.message.contains("manuscript")
+                && w.code == codes::UNRECOGNIZED_TOP_LEVEL_KEY_DROPPED));
+    }
+
+    #[test]
+    fn manuscript_article_and_notebooks_become_toc_entries_article_first() {
+        let quarto = "project:\n  type: manuscript\ntitle: X\nmanuscript:\n  article: article.qmd\n  notebooks:\n    - notebook: analysis.ipynb\n    - notebook: analysis_r.qmd\n";
+        let result = convert(quarto, None).unwrap();
+        assert!(result.text.contains(
+            "toc:\n    - file: article.md\n    - file: analysis.ipynb\n    - file: analysis_r.md\n"
+        ), "{}", result.text);
+    }
+
+    #[test]
+    fn manuscript_article_is_restored_onto_the_exports_field_for_a_later_forward_round_trip() {
+        let quarto = "project:\n  type: manuscript\ntitle: X\nformat:\n  typst: {}\nmanuscript:\n  article: article.qmd\n";
+        let result = convert(quarto, None).unwrap();
+        assert!(
+            result.text.contains("article: article.md"),
+            "{}",
+            result.text
+        );
+    }
+
+    /// Regression: `format: html` is not a legal `exports[].format` value in
+    /// myst.yml (MyST's own validator rejects it — valid set is `pdf`,
+    /// `tex`, `pdf+tex`, `typst`, `docx`, `xml`, `md`, `meca`, `cff`). The
+    /// forward direction always emits `html` as Quarto's default format, so
+    /// round-tripping it back must skip it, not corrupt the output.
+    #[test]
+    fn html_format_is_skipped_not_passed_through_as_an_invalid_export() {
+        let quarto = "title: X\nformat:\n  html: {}\n  typst: {}\n";
+        let result = convert(quarto, None).unwrap();
+        assert!(!result.text.contains("format: html"));
+        assert!(result.text.contains("format: typst"));
+        assert!(result.warnings.iter().all(|w| !w.message.contains("html")));
+    }
+
+    #[test]
+    fn manuscript_article_attaches_correctly_when_html_is_the_only_format() {
+        let quarto = "project:\n  type: manuscript\ntitle: X\nformat:\n  html: {}\nmanuscript:\n  article: article.qmd\n";
+        let result = convert(quarto, None).unwrap();
+        assert!(!result.text.contains("format: html"));
+        assert!(
+            result.text.contains("article: article.md"),
+            "{}",
+            result.text
+        );
+    }
+
+    #[test]
+    fn manuscript_with_no_format_key_still_restores_article() {
+        let quarto =
+            "project:\n  type: manuscript\ntitle: X\nmanuscript:\n  article: article.qmd\n";
+        let result = convert(quarto, None).unwrap();
+        assert!(result.text.contains("exports:\n    - article: article.md\n"));
     }
 
     #[test]

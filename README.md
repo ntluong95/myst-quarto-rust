@@ -106,15 +106,36 @@ renames are tracked in `.mystquarto/labels.json` so `fig:samples` ↔
 | `project.bibliography` | `bibliography:` |
 | `project.toc` | `book.chapters:` |
 | `site.template: book-theme` | `project.type: book` |
+| `site.template: article-theme` | `project.type: manuscript` |
+| `project.exports[].article` | `manuscript.article` |
+| `project.toc` (article + `.ipynb` entries) | `manuscript.notebooks` |
 | `project.exports[format: pdf]` | `format.pdf:` |
+
+`format:` on the Quarto side always gets `html:` as its first (default) entry
+— Quarto's `format:` map renders whichever key comes first when no `--to` is
+given, and `typst`/`docx`/`pdf` are alternates, never the default render
+target. `typst` always carries `number-sections: true`, since Quarto's Typst
+writer can't resolve a cross-reference to an unnumbered heading. `html` is
+never round-tripped back into myst.yml's `exports[]` on the reverse
+direction — it isn't a legal value there (MyST's own schema rejects it) and
+is the implicit default on both sides.
 
 ### Frontmatter (per-file YAML)
 
 | MyST | Quarto |
 |---|---|
 | `kernelspec: {name: python3}` | `jupyter: python3` |
+| `kernelspec: {name: ir}` | `engine: knitr` |
 | `label:` | `id:` |
 | `exports:` | `format:` |
+
+A page with an `{r}` code-cell but no `engine:`/`jupyter:` frontmatter at
+all still gets `kernelspec: {name: ir}` on conversion to MyST — Quarto
+infers the R engine implicitly from the fence, so the converter checks the
+body, not just the frontmatter. See
+[`docs/diagnostics.md`](docs/diagnostics.md) (MQ0412/MQ0413) for what's
+additionally needed to make it *execute* under MyST, not just display as
+code — installing IRkernel alone is not enough.
 
 ## Architecture
 

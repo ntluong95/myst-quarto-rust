@@ -117,10 +117,29 @@ pub fn canonicalize_root(root: &Path) -> Result<PathBuf, PathGuardError> {
 /// non-existent trailing components verbatim (a component that does not
 /// exist cannot be a symlink, so there is nothing to resolve in it).
 ///
+/// A relative `path` is joined onto [`std::env::current_dir`] first: a bare
+/// relative path with no components that exist yet (e.g. a brand-new output
+/// directory name typed with no leading `./`) has `Path::parent()` bottom
+/// out at `""` — which does not canonicalize and has no parent of its own —
+/// so without this the walk gave up even though the current directory
+/// plainly exists.
+///
 /// # Errors
 /// Returns [`PathGuardError::Canonicalize`] only if no ancestor of `path`
 /// exists at all (not even `/`), which in practice should not happen.
 pub fn canonicalize_best_effort(path: &Path) -> Result<PathBuf, PathGuardError> {
+    let anchored;
+    let path: &Path = if path.is_absolute() {
+        path
+    } else {
+        let cwd = std::env::current_dir().map_err(|source| PathGuardError::Canonicalize {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        anchored = cwd.join(path);
+        &anchored
+    };
+
     let mut existing = path;
     let mut trailing: Vec<std::ffi::OsString> = Vec::new();
 
@@ -433,6 +452,25 @@ mod tests {
         assert_eq!(resolved, canonical_root.join("out").join("doc.qmd"));
 
         cleanup(&tmp);
+    }
+
+    /// Regression: a brand-new relative output directory typed with no
+    /// leading `./` (e.g. `myst2quarto in -o out-dir`, `out-dir` not yet
+    /// created) must resolve, not fail with "no existing ancestor to
+    /// canonicalize" — `Path::parent()` on a bare relative name bottoms out
+    /// at `""` before reaching the current directory, which does exist.
+    /// Uses the real process cwd (not a chdir) so this doesn't race with
+    /// other tests running in the same process.
+    #[test]
+    fn canonicalize_best_effort_resolves_a_brand_new_relative_dir_with_no_existing_ancestor() {
+        let name = format!("mystquarto-path-guard-brand-new-{}", unique_suffix());
+        let path = Path::new(&name);
+
+        let resolved = canonicalize_best_effort(path)
+            .expect("a not-yet-existing relative dir under an existing cwd must resolve");
+
+        let cwd = canonicalize_root(&std::env::current_dir().unwrap()).unwrap();
+        assert_eq!(resolved, cwd.join(&name));
     }
 
     // --- test helpers -------------------------------------------------

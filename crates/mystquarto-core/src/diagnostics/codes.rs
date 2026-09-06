@@ -117,6 +117,34 @@ pub mod config {
     /// `image:` slot, so `banner` was used and `thumbnail` silently has no
     /// output otherwise. Severity: Warning.
     pub const BANNER_AND_THUMBNAIL_BOTH_SET: &str = "MQ0411";
+    /// A page's `engine: knitr` was mapped to `kernelspec: {name: ir, ...}`
+    /// — MyST has no knitr engine, only Jupyter kernels, so the converted
+    /// document needs a working R execution setup that Quarto's native
+    /// knitr needed none of: an installed+registered IRkernel, MyST's
+    /// `jupyter_kernel_gateway` execution backend specifically (a plain
+    /// `jupyter server` install is not enough), and `--execute` on
+    /// `myst build`/`myst start` (off by default). The full checklist is in
+    /// the diagnostic message itself — verified end to end against a real
+    /// conversion, not guessed. Severity: LossyExpected (the mapping is
+    /// correct — MyST genuinely has no other way to represent an R engine —
+    /// but the result isn't executable as-is).
+    pub const ENGINE_KNITR_REQUIRES_IRKERNEL: &str = "MQ0412";
+    /// A Quarto page has an `{r}` code-cell but no `engine:`/`jupyter:`
+    /// frontmatter to map — Quarto infers the R (knitr) engine implicitly
+    /// from the code fence itself, something MyST's frontmatter-only
+    /// mapping can't see without also inspecting the body. A
+    /// `kernelspec: {name: ir, ...}` was synthesized from the detected code
+    /// cell language so the document stays executable. Severity:
+    /// LossyExpected (same disposition and setup checklist as
+    /// `ENGINE_KNITR_REQUIRES_IRKERNEL`).
+    pub const ENGINE_INFERRED_FROM_CODE_CELLS: &str = "MQ0413";
+    /// A Quarto manuscript's `manuscript.article`/`manuscript.notebooks`
+    /// were mapped back to myst.yml's `project.toc` (and
+    /// `project.exports[].article`) so the converted MyST project still
+    /// knows which page is the primary article — without this, MyST has no
+    /// signal for which document is the manuscript's main page. Severity:
+    /// Info.
+    pub const MANUSCRIPT_ARTICLE_RESTORED: &str = "MQ0414";
 }
 
 /// MQ06xx — file, IO, path safety, discovery.

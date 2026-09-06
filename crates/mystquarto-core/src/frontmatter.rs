@@ -23,7 +23,7 @@ use crate::config::exports;
 use crate::config::quarto_to_myst::format_to_exports;
 use crate::config::{as_str, get, string_field, warn, Diagnostic, Severity};
 use crate::diagnostics::codes::config as codes;
-use crate::ir::Frontmatter;
+use crate::ir::{Engine, Frontmatter};
 use crate::yaml::surgery::{apply_edits, FrontmatterEdit};
 use crate::yaml::YamlValue;
 
@@ -163,9 +163,32 @@ pub fn myst_to_quarto(fm: &Frontmatter) -> (String, Vec<Diagnostic>) {
     (text, warnings)
 }
 
+/// The full checklist for making an `ir`-kernelspec MyST document actually
+/// executable — verified end to end against a real conversion, not just
+/// "install IRkernel": MyST's execution backend specifically needs
+/// `jupyter_kernel_gateway` (a plain `jupyter server` install is not
+/// enough, and produces no clearer error than a generic "Jupyter server did
+/// not start"), and execution is opt-in — `myst build`/`myst start` never
+/// run any code cell unless `--execute` is passed.
+const R_EXECUTION_SETUP_STEPS: &str = "to actually execute it: (1) install and register an R \
+     kernel — `R -e 'install.packages(\"IRkernel\"); IRkernel::installspec()'`; (2) install \
+     MyST's execution backend — `pip install jupyter_kernel_gateway` (plain `jupyter server` \
+     is not enough); (3) build or preview with execution enabled — `myst build --execute` or \
+     `myst start --execute` (both default to off)";
+
 /// Converts a Quarto-sourced [`Frontmatter`]'s raw text to MyST's dialect.
+///
+/// `inferred_engine` is the document's [`Engine`] as detected from its body
+/// (`crate::reader::quarto`'s `detect_engine` — an `{r}` code-cell implies
+/// `Engine::Knitr` even with no `engine:`/`jupyter:` frontmatter field to
+/// read, since Quarto infers the engine from the fence itself). It is only
+/// consulted when the frontmatter itself declares neither — an explicit
+/// `jupyter:`/`engine:` always wins.
 #[must_use]
-pub fn quarto_to_myst(fm: &Frontmatter) -> (String, Vec<Diagnostic>) {
+pub fn quarto_to_myst(
+    fm: &Frontmatter,
+    inferred_engine: Option<Engine>,
+) -> (String, Vec<Diagnostic>) {
     let crate::yaml::YamlValue::Mapping(parsed) = &fm.parsed else {
         return (fm.raw.clone(), Vec::new());
     };
@@ -189,7 +212,33 @@ pub fn quarto_to_myst(fm: &Frontmatter) -> (String, Vec<Diagnostic>) {
                 key: "kernelspec".to_string(),
                 value: kernelspec_for("ir"),
             });
+            warnings.push(warn(
+                Severity::LossyExpected,
+                codes::ENGINE_KNITR_REQUIRES_IRKERNEL,
+                format!(
+                    "page frontmatter `engine: knitr` was mapped to `kernelspec: {{name: ir}}` \
+                     — MyST has no knitr engine, only Jupyter kernels; Quarto's native knitr \
+                     needed none of the following, but MyST does — {R_EXECUTION_SETUP_STEPS} \
+                     (reference §6)"
+                ),
+            ));
         }
+    } else if inferred_engine == Some(Engine::Knitr) && get(parsed, "kernelspec").is_none() {
+        edits.push(FrontmatterEdit::Set {
+            key: "kernelspec".to_string(),
+            value: kernelspec_for("ir"),
+        });
+        warnings.push(warn(
+            Severity::LossyExpected,
+            codes::ENGINE_INFERRED_FROM_CODE_CELLS,
+            format!(
+                "page has an `{{r}}` code-cell but no `engine:`/`jupyter:` frontmatter — \
+                 Quarto infers the R (knitr) engine implicitly from the code fence itself; \
+                 `kernelspec: {{name: ir}}` was synthesized from the detected code-cell \
+                 language so the document stays executable — {R_EXECUTION_SETUP_STEPS} \
+                 (reference §6)"
+            ),
+        ));
     }
 
     if let Some(format) = get(parsed, "format").and_then(|v| match v {
@@ -303,7 +352,7 @@ mod tests {
 
     #[test]
     fn jupyter_python3_maps_back_to_kernelspec_with_display_name() {
-        let (text, _) = quarto_to_myst(&fm("title: Foo\njupyter: python3\n"));
+        let (text, _) = quarto_to_myst(&fm("title: Foo\njupyter: python3\n"), None);
         assert!(text.contains("kernelspec:"));
         assert!(text.contains("name: python3"));
         assert!(text.contains("display_name: Python 3"));
@@ -312,7 +361,7 @@ mod tests {
 
     #[test]
     fn engine_knitr_maps_back_to_kernelspec_ir() {
-        let (text, _) = quarto_to_myst(&fm("title: Foo\nengine: knitr\n"));
+        let (text, _) = quarto_to_myst(&fm("title: Foo\nengine: knitr\n"), None);
         assert!(text.contains("name: ir"));
         assert!(text.contains("display_name: R"));
         assert!(!text.contains("engine:"));
@@ -322,8 +371,40 @@ mod tests {
     fn round_trip_kernelspec_python3() {
         let original = fm("title: Foo\nkernelspec:\n  name: python3\n  display_name: Python 3\n");
         let (forward, _) = myst_to_quarto(&original);
-        let (back, _) = quarto_to_myst(&fm(&forward));
+        let (back, _) = quarto_to_myst(&fm(&forward), None);
         assert!(back.contains("name: python3"));
         assert!(back.contains("display_name: Python 3"));
+    }
+
+    /// The exact bug: a page with an `{r}` code-cell but no `engine:`/
+    /// `jupyter:` frontmatter at all (Quarto infers knitr implicitly from
+    /// the fence) must still get a kernelspec, not lose its executability.
+    #[test]
+    fn r_engine_inferred_from_code_cells_gets_a_kernelspec_when_frontmatter_is_silent() {
+        let (text, warnings) = quarto_to_myst(&fm("title: R Analysis Component\n"), Some(Engine::Knitr));
+        assert!(text.contains("kernelspec:"));
+        assert!(text.contains("name: ir"));
+        assert!(text.contains("display_name: R"));
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, codes::ENGINE_INFERRED_FROM_CODE_CELLS);
+    }
+
+    #[test]
+    fn explicit_engine_field_wins_over_inferred_engine() {
+        let (text, warnings) = quarto_to_myst(&fm("title: Foo\nengine: knitr\n"), Some(Engine::Knitr));
+        assert!(text.contains("name: ir"));
+        assert_eq!(
+            warnings.len(),
+            1,
+            "must not double-warn once for the explicit field and again for inference"
+        );
+        assert_eq!(warnings[0].code, codes::ENGINE_KNITR_REQUIRES_IRKERNEL);
+    }
+
+    #[test]
+    fn no_kernelspec_synthesized_when_no_engine_is_inferred() {
+        let (text, warnings) = quarto_to_myst(&fm("title: Foo\n"), None);
+        assert!(!text.contains("kernelspec"));
+        assert!(warnings.is_empty());
     }
 }

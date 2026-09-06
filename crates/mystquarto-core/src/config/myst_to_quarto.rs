@@ -498,7 +498,8 @@ mod tests {
             "project:\n  exports:\n    - template: lapreprint-typst\n      article: article.md\n";
         let result = convert(myst, None).unwrap();
         assert!(!result.text.contains("format: {}"));
-        assert!(result.text.contains("format:\n  typst: {}\n"));
+        assert!(result.text.contains("format:\n  html:\n"));
+        assert!(result.text.contains("typst:\n    number-sections: true\n"));
         assert!(result.text.contains("lapreprint-typst"));
     }
 
@@ -572,7 +573,8 @@ mod tests {
         assert!(text.contains("repo-url: https://github.com/rowanc1/article-template"));
         assert!(text.contains("license: CC-BY-4.0"));
         assert!(text.contains("image: banner.png"));
-        assert!(text.contains("format:\n  typst: {}\n"));
+        assert!(text.contains("format:\n  html:\n"));
+        assert!(text.contains("typst:\n    number-sections: true\n"));
         assert!(text.contains("lapreprint-typst"));
         assert!(text.contains("manuscript:\n  article: article.qmd\n"));
 

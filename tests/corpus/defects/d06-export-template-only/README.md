@@ -47,3 +47,15 @@ this fixture's `format:` key) exits 0, compiles to PDF, no `ERROR`.
 
 **Result vs. prediction.** Matched exactly — `python-actual.yml` is
 `title: Sample Article\nformat: {}\n`.
+
+**Rust behavior update (2026-09-06).** The Rust converter's `format:` map
+always leads with `html:` (Quarto's `format:` map renders its first key by
+default, and `typst`/`docx`/`pdf` are export alternatives, never the default
+render target) plus a sensible default option block. `typst` additionally
+always gets `number-sections: true` — Quarto's Typst writer compiles
+`@sec-xxx` cross-references to `#ref(<sec-xxx>, ...)`, and Typst refuses to
+reference an unnumbered heading, so any document with a section
+cross-reference previously failed `quarto render --to typst` with `cannot
+reference heading without numbering`. See
+`crates/mystquarto-core/src/config/exports.rs`'s `html_defaults`/
+`default_format_options`.
