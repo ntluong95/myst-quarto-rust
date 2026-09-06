@@ -71,8 +71,8 @@ pub fn convert(
     let root = parse_mapping(quarto_text)?;
     let project_type = string_field(mapping_field(&root, "project"), "type");
     let is_book = project_type.as_deref() == Some("book") || get(&root, "book").is_some();
-    let is_manuscript =
-        !is_book && (project_type.as_deref() == Some("manuscript") || get(&root, "manuscript").is_some());
+    let is_manuscript = !is_book
+        && (project_type.as_deref() == Some("manuscript") || get(&root, "manuscript").is_some());
 
     let mut warnings = Vec::new();
     let mut project_fields: Vec<(String, YamlValue)> = Vec::new();
@@ -629,7 +629,9 @@ mod tests {
         let quarto =
             "project:\n  type: manuscript\ntitle: X\nmanuscript:\n  article: article.qmd\n";
         let result = convert(quarto, None).unwrap();
-        assert!(result.text.contains("exports:\n    - article: article.md\n"));
+        assert!(result
+            .text
+            .contains("exports:\n    - article: article.md\n"));
     }
 
     #[test]

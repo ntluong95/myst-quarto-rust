@@ -118,7 +118,10 @@ fn html_defaults() -> YamlValue {
         ("number-sections".to_string(), YamlValue::Bool(true)),
         ("citations-hover".to_string(), YamlValue::Bool(true)),
         ("crossrefs-hover".to_string(), YamlValue::Bool(true)),
-        ("toc-location".to_string(), YamlValue::String("right".to_string())),
+        (
+            "toc-location".to_string(),
+            YamlValue::String("right".to_string()),
+        ),
         (
             "title-block-style".to_string(),
             YamlValue::String("manuscript".to_string()),

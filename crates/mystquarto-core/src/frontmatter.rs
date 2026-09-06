@@ -381,7 +381,8 @@ mod tests {
     /// the fence) must still get a kernelspec, not lose its executability.
     #[test]
     fn r_engine_inferred_from_code_cells_gets_a_kernelspec_when_frontmatter_is_silent() {
-        let (text, warnings) = quarto_to_myst(&fm("title: R Analysis Component\n"), Some(Engine::Knitr));
+        let (text, warnings) =
+            quarto_to_myst(&fm("title: R Analysis Component\n"), Some(Engine::Knitr));
         assert!(text.contains("kernelspec:"));
         assert!(text.contains("name: ir"));
         assert!(text.contains("display_name: R"));
@@ -391,7 +392,8 @@ mod tests {
 
     #[test]
     fn explicit_engine_field_wins_over_inferred_engine() {
-        let (text, warnings) = quarto_to_myst(&fm("title: Foo\nengine: knitr\n"), Some(Engine::Knitr));
+        let (text, warnings) =
+            quarto_to_myst(&fm("title: Foo\nengine: knitr\n"), Some(Engine::Knitr));
         assert!(text.contains("name: ir"));
         assert_eq!(
             warnings.len(),
