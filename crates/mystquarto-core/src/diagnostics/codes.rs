@@ -107,7 +107,8 @@ pub mod config {
     /// Severity: Warning.
     pub const FORMAT_PASSED_THROUGH: &str = "MQ0408";
     /// A root-level `_quarto.yml` key has no myst.yml equivalent at all
-    /// (e.g. `execute:`, `csl:`); dropped. Severity: Warning.
+    /// (e.g. `execute:`, `csl:`); kept in the config snapshot and restored
+    /// when converting back. Severity: LossyExpected.
     pub const UNRECOGNIZED_TOP_LEVEL_KEY_DROPPED: &str = "MQ0409";
     /// A page-frontmatter field has no correct target in the other dialect
     /// (`label`, `math`); dropped rather than mismapped. Severity:
@@ -145,6 +146,15 @@ pub mod config {
     /// signal for which document is the manuscript's main page. Severity:
     /// Info.
     pub const MANUSCRIPT_ARTICLE_RESTORED: &str = "MQ0414";
+    /// The input carried the *target* dialect's config too (a stale
+    /// `myst.yml` next to `_quarto.yml`); it was ignored in favour of
+    /// converting the source config, and its text was kept in
+    /// `.mystquarto/preserved.json`. Severity: Info.
+    pub const TARGET_CONFIG_IN_INPUT_IGNORED: &str = "MQ0415";
+    /// The target config was restored from the snapshot a previous
+    /// conversion recorded, verbatim or with the user's edits merged in.
+    /// Severity: Info.
+    pub const CONFIG_RESTORED_FROM_SNAPSHOT: &str = "MQ0416";
 }
 
 /// MQ06xx — file, IO, path safety, discovery.

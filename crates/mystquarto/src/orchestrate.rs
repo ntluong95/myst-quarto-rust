@@ -50,12 +50,13 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
+use mystquarto_core::config::snapshot::Restored;
 use mystquarto_core::diagnostics::{codes, Diagnostic, Severity};
 use mystquarto_core::fs::assets::{self, AssetCopyReport};
 use mystquarto_core::fs::atomic::write_atomic;
 use mystquarto_core::fs::path_guard;
 use mystquarto_core::pipeline::{self, BatchFileError};
-use mystquarto_core::preserve::{self, PreservedEntry};
+use mystquarto_core::preserve::{self, ConfigSnapshot, IgnoredConfig, PreservedEntry};
 use mystquarto_core::{notebook, registry::sidecar};
 
 use crate::args::{ConvertArgs, StrictLevel};
@@ -293,6 +294,8 @@ fn execute_directory(
     }
 
     if !args.no_config {
+        let ignored_config =
+            ignore_target_config_in_input(canonical_input, direction, args.dry_run, &mut warnings);
         for config_path in &config_files {
             let out_config_path = effective_output_root.join(direction.target_config_name());
 
@@ -321,17 +324,34 @@ fn execute_directory(
                 continue;
             }
 
-            match convert_config_file(
+            let written = convert_config_file(
                 config_path,
                 direction,
                 canonical_input,
                 effective_output_root,
+                &content_files,
                 &batch,
-            ) {
-                Ok((text, config_warnings)) => {
-                    write_atomic(&out_config_path, text.as_bytes()).with_context(|| {
-                        format!("could not write {}", out_config_path.display())
-                    })?;
+            )
+            .and_then(|converted| {
+                write_atomic(&out_config_path, converted.text.as_bytes())
+                    .with_context(|| format!("could not write {}", out_config_path.display()))?;
+                let record_path = effective_output_root
+                    .join(SIDECAR_DIR)
+                    .join(PRESERVED_CONFIG_FILE);
+                preserve::write_config_record(
+                    Some(ConfigSnapshot {
+                        name: direction.source_config_name().to_string(),
+                        source: converted.source,
+                        derived: converted.text,
+                    }),
+                    ignored_config.clone(),
+                    &record_path,
+                )
+                .with_context(|| format!("could not write {}", record_path.display()))?;
+                Ok(converted.warnings)
+            });
+            match written {
+                Ok(config_warnings) => {
                     outcomes.push(FileOutcome {
                         input: config_path.clone(),
                         output: out_config_path,
@@ -343,7 +363,7 @@ fn execute_directory(
                     outcomes.push(FileOutcome {
                         input: config_path.clone(),
                         output: out_config_path,
-                        status: FileStatus::Failed(e.to_string()),
+                        status: FileStatus::Failed(format!("{e:#}")),
                     });
                 }
             }
@@ -412,7 +432,10 @@ fn execute_directory(
 
         if !args.in_place && !args.dry_run {
             let content_ext = [direction.source_extension()];
-            let config_names = [source_config_name];
+            // Both dialects' configs: the source one was converted above,
+            // and a target-dialect one in the input is a stale source
+            // artifact that must never overwrite the converted config.
+            let config_names = [source_config_name, direction.target_config_name()];
             let report = assets::copy_assets(
                 canonical_input,
                 effective_output_root,
@@ -655,10 +678,94 @@ fn write_preserved_content_sidecar(
     Ok(())
 }
 
-/// Converts one config file (`myst.yml`/`_quarto.yml`) and returns its
-/// rendered text plus any non-fatal notices — bibliography synthesis and the
-/// RT-14 missing-citation diagnostic for `MystToQuarto`, or the restored
-/// `.mystquarto/preserved.json` fields for `QuartoToMyst`.
+/// A converted config file, ready to write.
+struct ConvertedConfig {
+    /// The source config's exact text, recorded in the snapshot.
+    source: String,
+    /// The target config text to write.
+    text: String,
+    warnings: Vec<Diagnostic>,
+}
+
+/// If the input also holds the *target* dialect's config (ASK projects
+/// used to ship a hand-kept `myst.yml` beside `_quarto.yml`), it is a stale
+/// source artifact: the run converts the source config instead, says so, and
+/// keeps the ignored text in the sidecar so nothing the user wrote is lost.
+fn ignore_target_config_in_input(
+    canonical_input: &Path,
+    direction: Direction,
+    dry_run: bool,
+    warnings: &mut Vec<Diagnostic>,
+) -> Option<IgnoredConfig> {
+    let name = direction.target_config_name();
+    let path = canonical_input.join(name);
+    let text = fs::read_to_string(&path).ok()?;
+    warnings.push(
+        Diagnostic::new(
+            Severity::Info,
+            codes::config::TARGET_CONFIG_IN_INPUT_IGNORED,
+            format!(
+                "ignored the input's own {name}; converted {} instead{}",
+                direction.source_config_name(),
+                if dry_run {
+                    ""
+                } else {
+                    " and kept the ignored text in .mystquarto/preserved.json"
+                }
+            ),
+        )
+        .with_file(path),
+    );
+    Some(IgnoredConfig {
+        name: name.to_string(),
+        text,
+    })
+}
+
+/// A config conversion's text, diagnostics, and (MyST->Quarto only) the
+/// `myst.yml` fields preserved for the reverse direction.
+type ConfigText = (
+    String,
+    Vec<Diagnostic>,
+    Option<std::collections::BTreeMap<String, mystquarto_core::YamlValue>>,
+);
+
+/// Converts `text` (a whole source config) with no side effects — the part
+/// of [`convert_config_file`] the snapshot merge also needs for its base.
+fn convert_config_text(
+    text: &str,
+    direction: Direction,
+    canonical_input: &Path,
+) -> Result<ConfigText, mystquarto_core::yaml::YamlReadError> {
+    match direction {
+        Direction::MystToQuarto => {
+            let bib_path = find_bib_file(canonical_input);
+            let result =
+                mystquarto_core::config::myst_to_quarto::convert(text, bib_path.as_deref())?;
+            Ok((result.text, result.warnings, Some(result.preserved_fields)))
+        }
+        Direction::QuartoToMyst => {
+            let sidecar_path = canonical_input
+                .join(SIDECAR_DIR)
+                .join(PRESERVED_CONFIG_FILE);
+            let preserved = mystquarto_core::config::sidecar::read(&sidecar_path).map(|p| {
+                p.fields
+                    .iter()
+                    .map(|(k, v)| (k.clone(), mystquarto_core::config::sidecar::json_to_yaml(v)))
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            });
+            let result =
+                mystquarto_core::config::quarto_to_myst::convert(text, preserved.as_ref())?;
+            Ok((result.text, result.warnings, None))
+        }
+    }
+}
+
+/// Converts one config file (`myst.yml`/`_quarto.yml`): the plain
+/// conversion, then bibliography synthesis and the RT-14 missing-citation
+/// check (`MystToQuarto`), then — when the input carries a snapshot a
+/// previous conversion recorded — restoration of the original config (see
+/// `mystquarto_core::config::snapshot`).
 ///
 /// The RT-14 citation-key check only runs when `batch` actually holds a
 /// `MystToQuarto` result (i.e. content was parsed this run — not under
@@ -674,99 +781,146 @@ fn convert_config_file(
     direction: Direction,
     canonical_input: &Path,
     effective_output_root: &Path,
+    content_files: &[PathBuf],
     batch: &Option<ContentBatch>,
-) -> Result<(String, Vec<Diagnostic>)> {
-    let text = fs::read_to_string(config_path)
+) -> Result<ConvertedConfig> {
+    let source = fs::read_to_string(config_path)
         .with_context(|| format!("could not read {}", config_path.display()))?;
     let with_file = |ds: Vec<Diagnostic>| -> Vec<Diagnostic> {
         ds.into_iter()
             .map(|d| d.with_file(config_path.to_path_buf()))
             .collect()
     };
+    let (mut text, config_warnings, preserved_fields) =
+        convert_config_text(&source, direction, canonical_input)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", config_path.display()))?;
+    let mut warnings = with_file(config_warnings);
 
-    match direction {
-        Direction::MystToQuarto => {
-            let bib_path = find_bib_file(canonical_input);
-            let mut result =
-                mystquarto_core::config::myst_to_quarto::convert(&text, bib_path.as_deref())
-                    .map_err(|e| anyhow::anyhow!("{}: {e}", config_path.display()))?;
+    if let Some(preserved_fields) = preserved_fields {
+        // Written unconditionally, even when empty: this sidecar is the
+        // authoritative recovery channel (RT-11), so a run that removes
+        // every previously-unmappable field from myst.yml must clear the
+        // stale sidecar too, not leave it holding fields the source no
+        // longer has.
+        let sidecar_path = effective_output_root
+            .join(SIDECAR_DIR)
+            .join(PRESERVED_CONFIG_FILE);
+        mystquarto_core::config::sidecar::write(&preserved_fields, &sidecar_path)
+            .with_context(|| format!("could not write {}", sidecar_path.display()))?;
+    }
 
-            let mut warnings: Vec<Diagnostic> = with_file(result.warnings);
+    if let Some(ContentBatch::MystToQuarto {
+        used_citation_keys, ..
+    }) = batch
+    {
+        let defined = defined_citation_keys(&source, canonical_input, content_files);
+        let missing: std::collections::BTreeSet<String> =
+            used_citation_keys.difference(&defined).cloned().collect();
+        let generated_doi_refs: std::collections::BTreeSet<String> =
+            missing.into_iter().filter(|key| is_doi_key(key)).collect();
 
-            // Written unconditionally, even when empty: this sidecar is the
-            // authoritative recovery channel (RT-11), so a run that removes
-            // every previously-unmappable field from myst.yml must clear the
-            // stale sidecar too, not leave it holding fields the source no
-            // longer has.
-            let sidecar_path = effective_output_root
-                .join(SIDECAR_DIR)
-                .join(PRESERVED_CONFIG_FILE);
-            mystquarto_core::config::sidecar::write(&result.preserved_fields, &sidecar_path)
-                .with_context(|| format!("could not write {}", sidecar_path.display()))?;
-
-            if let Some(ContentBatch::MystToQuarto {
-                used_citation_keys, ..
-            }) = batch
-            {
-                let defined = if let Some(bib_rel) = &bib_path {
-                    if let Ok(bib_text) = fs::read_to_string(canonical_input.join(bib_rel)) {
-                        mystquarto_core::config::bibliography::bib_defined_keys(&bib_text)
-                    } else {
-                        std::collections::BTreeSet::new()
-                    }
-                } else {
-                    std::collections::BTreeSet::new()
-                };
-
-                let missing: std::collections::BTreeSet<String> =
-                    used_citation_keys.difference(&defined).cloned().collect();
-                let generated_doi_refs: std::collections::BTreeSet<String> =
-                    missing.into_iter().filter(|key| is_doi_key(key)).collect();
-
-                if !generated_doi_refs.is_empty() {
-                    let rel = format!("{SIDECAR_DIR}/{DOI_REFERENCES_FILE}");
-                    let path = effective_output_root.join(&rel);
-                    write_doi_bibliography_supplement(&generated_doi_refs, &path)
-                        .with_context(|| format!("could not write {}", path.display()))?;
-                    result.text = add_bibliography_path(&result.text, &rel);
-                    warnings.push(Diagnostic::new(
-                        Severity::Info,
-                        codes::bibliography::BIBLIOGRAPHY_SYNTHESIZED,
-                        format!(
-                            "generated {rel} with {} DOI citation fallback entrie(s) so \
-                             Quarto can resolve citations without MyST's live DOI lookup",
-                            generated_doi_refs.len()
-                        ),
-                    ));
-                }
-
-                let defined_or_generated = defined.union(&generated_doi_refs).cloned().collect();
-                warnings.extend(with_file(
-                    mystquarto_core::config::bibliography::missing_citation_warnings(
-                        used_citation_keys,
-                        &defined_or_generated,
-                    ),
-                ));
-            }
-
-            Ok((result.text, warnings))
+        if !generated_doi_refs.is_empty() {
+            let rel = format!("{SIDECAR_DIR}/{DOI_REFERENCES_FILE}");
+            let path = effective_output_root.join(&rel);
+            write_doi_bibliography_supplement(&generated_doi_refs, &path)
+                .with_context(|| format!("could not write {}", path.display()))?;
+            text = add_bibliography_path(&text, &rel);
+            warnings.push(Diagnostic::new(
+                Severity::Info,
+                codes::bibliography::BIBLIOGRAPHY_SYNTHESIZED,
+                format!(
+                    "generated {rel} with {} DOI citation fallback entrie(s) so \
+                     Quarto can resolve citations without MyST's live DOI lookup",
+                    generated_doi_refs.len()
+                ),
+            ));
         }
-        Direction::QuartoToMyst => {
-            let sidecar_path = canonical_input
-                .join(SIDECAR_DIR)
-                .join(PRESERVED_CONFIG_FILE);
-            let preserved = mystquarto_core::config::sidecar::read(&sidecar_path).map(|p| {
-                p.fields
-                    .iter()
-                    .map(|(k, v)| (k.clone(), mystquarto_core::config::sidecar::json_to_yaml(v)))
-                    .collect::<std::collections::BTreeMap<_, _>>()
-            });
-            let result =
-                mystquarto_core::config::quarto_to_myst::convert(&text, preserved.as_ref())
-                    .map_err(|e| anyhow::anyhow!("{}: {e}", config_path.display()))?;
-            Ok((result.text, with_file(result.warnings)))
+
+        let defined_or_generated = defined.union(&generated_doi_refs).cloned().collect();
+        warnings.extend(with_file(
+            mystquarto_core::config::bibliography::missing_citation_warnings(
+                used_citation_keys,
+                &defined_or_generated,
+            ),
+        ));
+    }
+
+    let snapshot = preserve::read(
+        &canonical_input
+            .join(SIDECAR_DIR)
+            .join(PRESERVED_CONFIG_FILE),
+    )
+    .and_then(|s| s.source_config)
+    .filter(|snap| snap.name == direction.target_config_name());
+    if let Some(snapshot) = snapshot {
+        let restored = mystquarto_core::config::snapshot::restore(&snapshot, &source, &text, |t| {
+            convert_config_text(t, direction, canonical_input).map(|(text, _, _)| text)
+        })
+        .map_err(|e| anyhow::anyhow!("{}: {e}", config_path.display()))?;
+        let how = match &restored {
+            Restored::Verbatim(_) => "restored exactly (the config was unchanged)",
+            Restored::Merged(_) => "restored with your edits merged in",
+        };
+        warnings.push(
+            Diagnostic::new(
+                Severity::Info,
+                codes::config::CONFIG_RESTORED_FROM_SNAPSHOT,
+                format!(
+                    "{} {how} from the snapshot in .mystquarto/preserved.json",
+                    direction.target_config_name()
+                ),
+            )
+            .with_file(config_path.to_path_buf()),
+        );
+        text = restored.text().to_string();
+    }
+
+    Ok(ConvertedConfig {
+        source,
+        text,
+        warnings,
+    })
+}
+
+/// Every citation key defined by a bibliography the project can reach:
+/// `myst.yml`'s `project.bibliography` (relative to the project root), a
+/// `.bib` at the root, and each page's frontmatter `bibliography`
+/// (relative to that page's directory).
+fn defined_citation_keys(
+    myst_config: &str,
+    canonical_input: &Path,
+    content_files: &[PathBuf],
+) -> std::collections::BTreeSet<String> {
+    use mystquarto_core::config::bibliography::{
+        bib_defined_keys, bibliography_entries, frontmatter_bibliography_entries,
+    };
+    let mut bibs: Vec<PathBuf> = Vec::new();
+    if let Ok(root) = mystquarto_core::yaml::parse_mapping(myst_config) {
+        if let Some((_, mystquarto_core::YamlValue::Mapping(project))) =
+            root.iter().find(|(k, _)| k == "project")
+        {
+            bibs.extend(
+                bibliography_entries(project)
+                    .into_iter()
+                    .map(|b| canonical_input.join(b)),
+            );
         }
     }
+    bibs.extend(find_bib_file(canonical_input).map(|b| canonical_input.join(b)));
+    for file in content_files {
+        let (Ok(text), Some(dir)) = (fs::read_to_string(file), file.parent()) else {
+            continue;
+        };
+        bibs.extend(
+            frontmatter_bibliography_entries(&text)
+                .into_iter()
+                .map(|b| dir.join(b)),
+        );
+    }
+    bibs.iter()
+        .filter_map(|b| fs::read_to_string(b).ok())
+        .flat_map(|text| bib_defined_keys(&text))
+        .collect()
 }
 
 fn is_doi_key(key: &str) -> bool {
@@ -1669,6 +1823,136 @@ mod tests {
         // --force allows the overwrite, and the write is now a real,
         // converted `_quarto.yml` — not the hand-authored placeholder.
         assert_eq!(fs::read_to_string(&existing).unwrap(), "title: Test\n");
+
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn a_config_write_failure_is_a_failed_outcome_and_a_non_zero_exit() {
+        let tmp = tempdir("config-write-fails");
+        write_myst_project(&tmp);
+        let output_dir = tmp.join("out");
+        // A directory where the config file must go makes the write fail
+        // while every content file still converts.
+        fs::create_dir_all(output_dir.join("_quarto.yml")).unwrap();
+
+        let mut args = base_args(tmp.clone());
+        args.output = Some(output_dir);
+        args.force = true;
+        let report = execute(&args, Direction::MystToQuarto).unwrap();
+
+        assert!(report.has_failures());
+        assert!(report
+            .outcomes
+            .iter()
+            .any(|o| o.input.ends_with("myst.yml") && matches!(o.status, FileStatus::Failed(_))));
+        assert_eq!(report.converted_count(), 2, "{:?}", report.outcomes);
+
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn a_stale_target_config_in_the_input_is_ignored_and_kept() {
+        let tmp = tempdir("stale-target-config");
+        let input = tmp.join("in");
+        fs::create_dir_all(&input).unwrap();
+        fs::write(
+            input.join("_quarto.yml"),
+            "project:\n  type: manuscript\nmanuscript:\n  article: index.qmd\n",
+        )
+        .unwrap();
+        fs::write(
+            input.join("myst.yml"),
+            "version: 1\nproject:\n  title: STALE\n",
+        )
+        .unwrap();
+        fs::write(input.join("index.qmd"), "# Hello\n").unwrap();
+
+        let mut args = base_args(input.clone());
+        args.output = Some(tmp.join("out"));
+        let report = execute(&args, Direction::QuartoToMyst).unwrap();
+
+        assert!(!report.has_failures(), "{:?}", report.outcomes);
+        let myst = fs::read_to_string(tmp.join("out/myst.yml")).unwrap();
+        assert!(!myst.contains("STALE"), "the stale config leaked:\n{myst}");
+        assert!(myst.contains("index.md"), "{myst}");
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.code == codes::config::TARGET_CONFIG_IN_INPUT_IGNORED));
+        let sidecar = preserve::read(&tmp.join("out/.mystquarto/preserved.json")).unwrap();
+        assert_eq!(sidecar.ignored_config.unwrap().name, "myst.yml");
+
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn a_config_round_trip_restores_the_original_text_exactly() {
+        let tmp = tempdir("config-round-trip");
+        let src = tmp.join("src");
+        fs::create_dir_all(&src).unwrap();
+        let original = "# comment kept\nproject:\n  type: manuscript\n  output-dir: _build/quarto\n  render:\n    - index.qmd\nmanuscript:\n  article: index.qmd\n  code-links:\n    - text: Code\n      href: https://example.org/r\nexecute:\n  freeze: auto\nformat:\n  html:\n    toc: true\n";
+        fs::write(src.join("_quarto.yml"), original).unwrap();
+        fs::write(src.join("index.qmd"), "# Hello\n").unwrap();
+
+        let mut to_myst = base_args(src);
+        to_myst.output = Some(tmp.join("myst"));
+        assert!(!execute(&to_myst, Direction::QuartoToMyst)
+            .unwrap()
+            .has_failures());
+        let mut back = base_args(tmp.join("myst"));
+        back.output = Some(tmp.join("back"));
+        let report = execute(&back, Direction::MystToQuarto).unwrap();
+        assert!(!report.has_failures(), "{:?}", report.outcomes);
+
+        assert_eq!(
+            fs::read_to_string(tmp.join("back/_quarto.yml")).unwrap(),
+            original
+        );
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.code == codes::config::CONFIG_RESTORED_FROM_SNAPSHOT));
+
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn citations_defined_in_a_project_or_page_bibliography_are_not_reported_missing() {
+        let tmp = tempdir("bib-reachability");
+        fs::create_dir_all(tmp.join("literature")).unwrap();
+        fs::create_dir_all(tmp.join("manuscript")).unwrap();
+        fs::write(
+            tmp.join("literature/references.bib"),
+            "@article{smith2020,\n  title = {A}\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("literature/extra.bib"),
+            "@book{doe2021,\n  title = {B}\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("myst.yml"),
+            "version: 1\nproject:\n  bibliography:\n    - literature/references.bib\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("manuscript/index.md"),
+            "---\nbibliography: ../literature/extra.bib\n---\n\nSee [@smith2020] and [@doe2021] and [@ghost2000].\n",
+        )
+        .unwrap();
+
+        let mut args = base_args(tmp.clone());
+        args.output = Some(tmp.join("out"));
+        let report = execute(&args, Direction::MystToQuarto).unwrap();
+        let missing: Vec<_> = report
+            .warnings
+            .iter()
+            .filter(|w| w.code == codes::bibliography::CITATION_KEY_MISSING)
+            .collect();
+        assert_eq!(missing.len(), 1, "{missing:?}");
+        assert!(missing[0].message.contains("ghost2000"), "{missing:?}");
 
         cleanup(&tmp);
     }

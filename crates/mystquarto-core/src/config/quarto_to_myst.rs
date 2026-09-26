@@ -151,7 +151,9 @@ pub fn convert(
     if let Some(v) = string_field(&root, "doi") {
         project_fields.push(("doi".to_string(), YamlValue::String(v)));
     }
-    if let Some(v) = string_field(&root, "repo-url") {
+    // MyST validates `github` as a GitHub URL or `owner/repo`; any other
+    // repository host has no myst.yml home (the snapshot keeps it).
+    if let Some(v) = string_field(&root, "repo-url").filter(|v| is_github_repo(v)) {
         project_fields.push(("github".to_string(), YamlValue::String(v)));
     }
     if let Some(v) = string_field(&root, "bibliography") {
@@ -251,12 +253,11 @@ pub fn convert(
                     first.push(("article".to_string(), YamlValue::String(article.clone())));
                 }
             }
-            _ => {
-                exports_field = Some(YamlValue::Sequence(vec![YamlValue::Mapping(vec![(
-                    "article".to_string(),
-                    YamlValue::String(article.clone()),
-                )])]));
-            }
+            // No export to attach it to. An article-only export is invalid
+            // in myst.yml (an export needs a format, template or output),
+            // and `project.toc` already names the article first, which the
+            // forward direction reads back.
+            _ => {}
         }
     }
     if let Some(e) = exports_field {
@@ -319,10 +320,11 @@ pub fn convert(
     for (key, _) in &root {
         if !HANDLED_ROOT_KEYS.contains(&key.as_str()) {
             warnings.push(warn(
-                Severity::Warning,
+                Severity::LossyExpected,
                 codes::UNRECOGNIZED_TOP_LEVEL_KEY_DROPPED,
                 format!(
-                    "_quarto.yml top-level key `{key}` has no myst.yml equivalent; dropped \
+                    "_quarto.yml top-level key `{key}` has no myst.yml equivalent; kept in \
+                     .mystquarto/preserved.json and restored when converting back \
                      (reference §8.1-8.3)"
                 ),
             ));
@@ -334,6 +336,20 @@ pub fn convert(
         is_book,
         warnings,
     })
+}
+
+/// A value MyST accepts for `project.github`: a github.com URL or an
+/// `owner/repo` shorthand.
+fn is_github_repo(value: &str) -> bool {
+    let value = value.trim();
+    if value.contains("://") {
+        return value.contains("://github.com/") || value.contains("://www.github.com/");
+    }
+    let mut parts = value.split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(owner), Some(repo), None) if !owner.is_empty() && !repo.is_empty()
+    )
 }
 
 /// Inverse of the forward direction's `rewrite_content_extension`
@@ -487,6 +503,20 @@ pub(crate) fn format_to_exports(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_github_repo_url_becomes_myst_github() {
+        let gh = convert("title: X\nrepo-url: https://github.com/o/r\n", None).unwrap();
+        assert!(
+            gh.text.contains("github: https://github.com/o/r"),
+            "{}",
+            gh.text
+        );
+        let other = convert("title: X\nrepo-url: https://gitlab.com/o/r\n", None).unwrap();
+        assert!(!other.text.contains("github"), "{}", other.text);
+        assert!(is_github_repo("o/r"));
+        assert!(!is_github_repo("https://example.org/o/r"));
+    }
 
     #[test]
     fn quarto_content_extension_rewrite_never_doubles_an_extension() {
@@ -657,21 +687,25 @@ mod tests {
         let quarto = "project:\n  type: manuscript\ntitle: X\nformat:\n  html: {}\nmanuscript:\n  article: article.qmd\n";
         let result = convert(quarto, None).unwrap();
         assert!(!result.text.contains("format: html"));
+        assert!(!result.text.contains("exports"), "{}", result.text);
         assert!(
-            result.text.contains("article: article.md"),
+            result.text.contains("toc:\n    - file: article.md\n"),
             "{}",
             result.text
         );
     }
 
     #[test]
-    fn manuscript_with_no_format_key_still_restores_article() {
+    fn manuscript_with_no_format_key_restores_the_article_as_the_first_toc_entry() {
         let quarto =
             "project:\n  type: manuscript\ntitle: X\nmanuscript:\n  article: article.qmd\n";
         let result = convert(quarto, None).unwrap();
-        assert!(result
-            .text
-            .contains("exports:\n    - article: article.md\n"));
+        assert!(
+            result.text.contains("toc:\n    - file: article.md\n"),
+            "{}",
+            result.text
+        );
+        assert!(!result.text.contains("exports"), "{}", result.text);
     }
 
     #[test]

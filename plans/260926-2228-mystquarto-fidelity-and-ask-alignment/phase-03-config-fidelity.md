@@ -1,7 +1,7 @@
 ---
 phase: 3
 title: Config conversion fidelity
-status: pending
+status: done
 repo: myst-quarto-rustCLI
 covers: [B4, B7, B8]
 ---
@@ -30,3 +30,13 @@ covers: [B4, B7, B8]
 - ASK fixture: round-trip `_quarto.yml` is semantically equal to the original (compare parsed YAML, ignoring comments and key order).
 - There are no MQ0301 warnings on either fixture.
 - Exit code is non-zero when a config write fails (unit test with a read-only output dir).
+
+## Result
+
+Configs now round-trip exactly on both e2e fixtures. `ask-manuscript` went from 41 to 23 problems. None of the remaining ones are about configs or bibliographies.
+
+- **B7 uses a snapshot, not a per-key preserve list.** Each conversion records the source config's exact text and the config it derived from it (`source_config` in `.mystquarto/preserved.json`, module `config::snapshot`). Converting back restores the original byte for byte, comments included, when the derived config is unchanged. When it was edited, a three-way merge applies only the edits. This covers every key in step 4's list, and any key added later. MQ0416 (Info) reports the restore, and MQ0409 is now LossyExpected ("kept and restored").
+- **B4.** Asset copy excludes both dialects' configs. A target-dialect config found in the input is ignored with MQ0415 (Info), and its text is kept under `ignored_config`. A config write failure is now a `Failed` outcome with a non-zero exit, instead of aborting the run.
+- **B7, invented fields.** `theme: default` and `comments.hypothesis` are no longer emitted. `repo-url` becomes `github` only for GitHub URLs, because MyST rejects other hosts.
+- **Found by the harness.** An article-only `exports` entry is invalid in mystmd 1.11. The reverse direction now leaves the article only in `project.toc`, and the forward direction reads the first non-notebook toc entry back as `manuscript.article`. Corpus case d08 was updated to match, since it now names the article instead of commenting out the toc.
+- **B8.** Citation keys resolve against `myst.yml` `project.bibliography` (relative to the root), a root `.bib`, and each page's frontmatter `bibliography` (relative to the page).

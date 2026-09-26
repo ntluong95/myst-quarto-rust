@@ -1,6 +1,5 @@
 project:
   type: manuscript
 title: Sample Article
-# mystquarto: no Quarto equivalent for these myst.yml fields
-# toc:
-#   - file: article.md
+manuscript:
+  article: article.qmd

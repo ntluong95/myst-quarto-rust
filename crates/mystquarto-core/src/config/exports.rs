@@ -105,17 +105,12 @@ pub fn exports_to_format(exports: &[YamlValue]) -> (Option<FormatField>, Vec<Dia
 
 /// Default `html:` option block emitted whenever `format:` is produced —
 /// `html` is always the default render target, never `typst`/`docx`/`pdf`.
+/// These options reproduce MyST's article layout (side table of contents,
+/// numbered sections, hover previews). Nothing MyST lacks is added: no
+/// theme override and no annotation service.
 fn html_defaults() -> YamlValue {
     YamlValue::Mapping(vec![
-        (
-            "theme".to_string(),
-            YamlValue::Sequence(vec![YamlValue::String("default".to_string())]),
-        ),
         ("toc".to_string(), YamlValue::Bool(true)),
-        (
-            "comments".to_string(),
-            YamlValue::Mapping(vec![("hypothesis".to_string(), YamlValue::Bool(true))]),
-        ),
         ("number-sections".to_string(), YamlValue::Bool(true)),
         ("citations-hover".to_string(), YamlValue::Bool(true)),
         ("crossrefs-hover".to_string(), YamlValue::Bool(true)),
