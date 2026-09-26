@@ -299,6 +299,7 @@ dependencies = [
  "clap",
  "mystquarto-core",
  "predicates",
+ "similar",
  "tempfile",
  "walkdir",
 ]

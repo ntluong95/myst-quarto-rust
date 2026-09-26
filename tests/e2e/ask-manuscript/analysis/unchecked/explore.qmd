@@ -1,0 +1,5 @@
+---
+title: Exploration
+---
+
+Decoy analytical notebook, not part of the manuscript.

@@ -1,0 +1,8 @@
+# Files a to-quarto run on this fixture may write. A trailing `/` allows
+# anything under that directory; every other line must exist exactly.
+_quarto.yml
+index.qmd
+chapter.qmd
+references.bib
+images/fig1.png
+.mystquarto/

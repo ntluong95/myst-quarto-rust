@@ -1,0 +1,1 @@
+# Lines allowed to differ after a full round trip, as `<file>: <trimmed line>`.

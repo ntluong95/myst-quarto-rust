@@ -1,0 +1,29 @@
+# ASK Quarto manuscript project config (canonical source).
+project:
+  type: manuscript
+  output-dir: _build/quarto
+  render:
+    - index.qmd
+    - manuscript/supplementary/*.qmd
+
+manuscript:
+  article: index.qmd
+  resources:
+    - literature/references.bib
+    - images/banner.png
+  code-links:
+    - text: GitHub
+      icon: github
+      href: "https://example.org/probe-repo"
+
+execute:
+  freeze: auto
+
+format:
+  html:
+    toc: true
+    number-sections: true
+    citations-hover: true
+    crossrefs-hover: true
+    toc-location: right
+    title-block-style: manuscript

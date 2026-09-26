@@ -7,8 +7,8 @@ rule the implementation applies must trace to a row in this document.
 
 | Side | Dialect | Version verified | Renderer |
 |---|---|---|---|
-| MyST | mystmd v1.x (**modern**) | `myst v1.10.1` | `myst build` |
-| Quarto | Quarto 1.4+ | `quarto 1.9.36` | `quarto render` |
+| MyST | mystmd v1.x (**modern**) | `myst v1.11.0` | `myst build` |
+| Quarto | Quarto 1.4+ | `quarto 1.11.5` | `quarto render` |
 
 > **Legacy MyST is read-only.** Sphinx / Jupyter Book v1 constructs
 > (`` {cite}`key` ``, `` {numref}`fig-x` ``, `:name:`) are accepted when *reading*

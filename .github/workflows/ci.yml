@@ -29,13 +29,19 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install pinned Rust toolchain (rust-toolchain.toml)
         run: rustup show
-      - name: Install Quarto 1.9.36
+      - name: Install Quarto 1.11.5
         run: |
-          curl -fsSL -o quarto.deb https://github.com/quarto-dev/quarto-cli/releases/download/v1.9.36/quarto-1.9.36-linux-amd64.deb
+          curl -fsSL -o quarto.deb https://github.com/quarto-dev/quarto-cli/releases/download/v1.11.5/quarto-1.11.5-linux-amd64.deb
           sudo dpkg -i quarto.deb
           quarto --version
-      - name: Install MyST 1.10.1
+      - name: Install MyST 1.11.0
         run: |
-          npm install -g mystmd@1.10.1
+          npm install -g mystmd@1.11.0
           myst --version
+      # The e2e ASK fixture executes a Python cell, so Quarto needs Jupyter.
+      - name: Install Jupyter for Quarto
+        run: |
+          python3 -m venv "$RUNNER_TEMP/jupyter"
+          "$RUNNER_TEMP/jupyter/bin/pip" install --quiet jupyter
+          echo "QUARTO_PYTHON=$RUNNER_TEMP/jupyter/bin/python" >> "$GITHUB_ENV"
       - run: cargo test -p mystquarto --features renderer-tests --test renderer
