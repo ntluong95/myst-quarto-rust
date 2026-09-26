@@ -1,7 +1,7 @@
 ---
 title: "mystquarto fidelity fixes and agent-science-kit alignment"
 description: "Fix every finding from the 2026-09-26 review so MyST↔Quarto conversion renders cleanly both ways and never pollutes ASK project folders."
-status: pending
+status: in-progress
 priority: P1
 effort: 5-7d
 branch: fix/fidelity-and-ask-alignment
