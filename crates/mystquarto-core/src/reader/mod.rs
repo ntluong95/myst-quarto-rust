@@ -264,6 +264,31 @@ pub(crate) fn preservation_marker_id(line: &str) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+/// The visible copy of a preserved construct right after its marker line
+/// (see `crate::writer::render_preserved`): its lines and the index of its
+/// closing fence.
+pub(crate) fn visible_preserved_block(
+    lines: &[&str],
+    start: usize,
+) -> Option<(Vec<String>, usize)> {
+    let class = crate::writer::PRESERVED_CLASS;
+    let line = lines.get(start)?;
+    if let Some(open) = fence::parse_quarto_code_open(line) {
+        if open.lang.contains(class) {
+            let (body, _, end) =
+                fence::take_fenced_body(lines, start, '`', open.fence_count, open.indent);
+            return Some((body, end));
+        }
+    }
+    let frame = fence::take_myst_directive(lines, start, 0)?;
+    (frame.open.name == "code-block"
+        && frame
+            .options
+            .get("class")
+            .is_some_and(|c| c.contains(class)))
+    .then(|| (frame.body, start + frame.end_line as usize))
+}
+
 pub(crate) fn parse_cell_options(lines: &[String]) -> (crate::CellOptions, usize) {
     let mut opts = crate::CellOptions::default();
     let mut consumed = 0;
@@ -273,7 +298,9 @@ pub(crate) fn parse_cell_options(lines: &[String]) -> (crate::CellOptions, usize
         };
         consumed += 1;
         match key.as_str() {
-            "fig-cap" => opts.caption = Some(unquote(&value)),
+            "fig-cap" | "caption" => opts.caption = Some(unquote(&value)),
+            // The cell's label is read separately into `CodeCell::label`.
+            "label" => {}
             "echo" if value == "false" => opts.tags.push("remove-input".to_string()),
             "output" if value == "false" => opts.tags.push("remove-output".to_string()),
             "include" if value == "false" => opts.tags.push("remove-cell".to_string()),

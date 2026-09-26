@@ -135,40 +135,40 @@ ref = "§2"
 myst = "danger"
 quarto = "callout-important"
 fidelity = "lossy"
-note = "Collapse to nearest of the five: danger/error→important, hint/seealso/attention→note. Lossy — warn"
+note = "Nearest of the five callouts plus the MyST kind as an extra class (`.callout-note .seealso`); rendered as the nearest callout, restored exactly on the way back"
 ref = "§2"
 
 [[directive]]
 myst = "error"
 quarto = "callout-important"
 fidelity = "lossy"
-note = "Collapse to nearest of the five: danger/error→important, hint/seealso/attention→note. Lossy — warn"
+note = "Nearest of the five callouts plus the MyST kind as an extra class (`.callout-note .seealso`); rendered as the nearest callout, restored exactly on the way back"
 ref = "§2"
 
 [[directive]]
 myst = "hint"
 quarto = "callout-note"
 fidelity = "lossy"
-note = "Collapse to nearest of the five: danger/error→important, hint/seealso/attention→note. Lossy — warn"
+note = "Nearest of the five callouts plus the MyST kind as an extra class (`.callout-note .seealso`); rendered as the nearest callout, restored exactly on the way back"
 ref = "§2"
 
 [[directive]]
 myst = "seealso"
 quarto = "callout-note"
 fidelity = "lossy"
-note = "Collapse to nearest of the five: danger/error→important, hint/seealso/attention→note. Lossy — warn"
+note = "Nearest of the five callouts plus the MyST kind as an extra class (`.callout-note .seealso`); rendered as the nearest callout, restored exactly on the way back"
 ref = "§2"
 
 [[directive]]
 myst = "attention"
 quarto = "callout-note"
 fidelity = "lossy"
-note = "Collapse to nearest of the five: danger/error→important, hint/seealso/attention→note. Lossy — warn"
+note = "Nearest of the five callouts plus the MyST kind as an extra class (`.callout-note .seealso`); rendered as the nearest callout, restored exactly on the way back"
 ref = "§2"
 
 [[directive]]
-myst = "admonition (custom title)"
-quarto = "callout-note title=\"My Title\""
+myst = "admonition Title + :class: tip"
+quarto = "callout-tip title=\"Title\""
 fidelity = "exact"
 ref = "§2"
 
@@ -183,26 +183,28 @@ ref = "§2"
 myst = "margin"
 quarto = "column-margin"
 fidelity = "exact"
-note = "MyST {aside} and {margin} both map here; reverse picks {aside}"
+note = "MyST {aside} and {margin} both map here; reverse picks {margin}"
 ref = "§2"
 
 [[directive]]
 myst = "aside"
 quarto = "column-margin"
 fidelity = "exact"
-note = "MyST {aside} and {margin} both map here; reverse picks {aside}"
+note = "MyST {aside} and {margin} both map here; reverse picks {margin}"
 ref = "§2"
 
 [[directive]]
 myst = "epigraph"
-fidelity = "unmappable"
-note = "Warn + preserve"
+quarto = "::: {.epigraph} + > quote"
+fidelity = "exact"
+note = "Blockquote in a div named after the directive; `-- Author` ↔ `> — Author`"
 ref = "§2"
 
 [[directive]]
 myst = "pull-quote"
-fidelity = "unmappable"
-note = "Warn + preserve"
+quarto = "::: {.pull-quote} + > quote"
+fidelity = "exact"
+note = "Blockquote in a div named after the directive; `-- Author` ↔ `> — Author`"
 ref = "§2"
 
 [[directive]]
@@ -234,14 +236,42 @@ ref = "§2"
 myst = "grid"
 quarto = "grid"
 fidelity = "lossy"
-note = "Quarto classes are Bootstrap, not semantic. Approximate"
+note = "{grid} N ↔ .grid with .g-col-12 .g-col-md-(12/N) items; responsive arguments use their md value"
 ref = "§2"
 
 [[directive]]
 myst = "card"
 quarto = "card"
 fidelity = "lossy"
-note = "Quarto classes are Bootstrap, not semantic. Approximate"
+note = "{card} Title ↔ .card item with a **Title** first line"
+ref = "§2"
+
+[[directive]]
+myst = "dropdown Title"
+quarto = "callout-note .dropdown collapse=\"true\" title=\"Title\""
+fidelity = "exact"
+note = "Collapsed note in Quarto; the .dropdown class restores {dropdown}"
+ref = "§2"
+
+[[directive]]
+myst = "list-table Caption + :header-rows: + :label:"
+quarto = "pipe table + : Caption {#tbl-x}"
+fidelity = "lossy"
+note = "Grid table when a cell spans several lines; single-line tables return as {table} around a pipe table, grid tables as {list-table}"
+ref = "§2"
+
+[[directive]]
+myst = "code-block lang + :linenos: :emphasize-lines: :caption:"
+quarto = "```{.lang code-line-numbers=\"true|1,3\" filename=\"caption\"}"
+fidelity = "exact"
+note = "Emphasized lines imply line numbers"
+ref = "§2"
+
+[[directive]]
+myst = "figure + nested figures + :class: layout-ncol-N"
+quarto = "::: {#fig-p layout-ncol=N} with subfigure images"
+fidelity = "exact"
+note = "Panel figure; MyST has no layout option, so the layout travels as a class"
 ref = "§2"
 
 # ---------------------------------------------------------------------------
@@ -331,8 +361,9 @@ ref = "§5"
 
 [[role]]
 myst = "abbr"
-fidelity = "unmappable"
-note = "Emit raw <abbr> + warn"
+quarto = "<abbr title=\"expansion\">term</abbr>"
+fidelity = "exact"
+note = "Raw HTML in Quarto; read back as {abbr}`term (expansion)`"
 ref = "§5"
 
 [[role]]
@@ -371,8 +402,8 @@ ref = "§5"
 [[role]]
 myst = "kbd"
 quarto = "[Ctrl-C]{.kbd}"
-fidelity = "lossy"
-note = "No Quarto semantic"
+fidelity = "exact"
+note = "A styled span in Quarto; read back as {kbd}"
 ref = "§5"
 
 [[role]]
@@ -391,6 +422,20 @@ myst = "[text](./other.md)"
 quarto = "[text](./other.qmd)"
 fidelity = "exact"
 note = "Extension rewrite"
+ref = "§5"
+
+[[inline]]
+myst = "[](#label)"
+quarto = "@label"
+fidelity = "exact"
+note = "MyST's empty link to a target is a cross-reference"
+ref = "§5"
+
+[[inline]]
+myst = "{math}`x`"
+quarto = "$x$"
+fidelity = "exact"
+note = "Returns as $x$, which MyST also reads"
 ref = "§5"
 
 [[inline]]

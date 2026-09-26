@@ -1,0 +1,4 @@
+<!-- mystquarto-roundtrip: stable -->
+```{.python code-line-numbers="true" filename="listing.py"}
+print("hi")
+```

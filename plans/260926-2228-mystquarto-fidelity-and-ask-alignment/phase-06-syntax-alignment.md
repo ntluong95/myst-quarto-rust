@@ -1,7 +1,7 @@
 ---
 phase: 6
 title: Syntax alignment
-status: pending
+status: done
 repo: myst-quarto-rustCLI
 covers: ["§3 table", B5, B6]
 ---
@@ -49,3 +49,23 @@ When a directive contains nested directives, the MyST writer must give the outer
 - Every S-row has a corpus case, and `tests/corpus` passes.
 - Phase 1 harness on `myst-native` gives: 0 ⚠️ from the allow-listed set, and a round-trip diff that is empty apart from blank lines.
 - The README tables are regenerated, and `doc-sync` passes.
+
+## Result
+
+Both e2e fixtures pass on Quarto 1.11.5 / mystmd 1.11.0: zero render problems in both directions, closure exact, and source untouched. The ASK round trip is byte-identical except YAML flow-vs-block style. The native MyST round trip differs only by the equivalent-spelling normalizations listed, each with a reason, in `tests/e2e/myst-native/allowed-diff.txt`. Every S-row has corpus cases (`tests/corpus/constructs/s01…s15`) in both directions where both exist. `nested_trees_survive_write_then_parse` and `nested_trees_survive_a_quarto_round_trip` are the nesting property tests. The workspace suite has 358 tests, all passing.
+
+Infrastructure fixed on the way:
+
+- Quarto attribute lists are tokenized properly. Quoted values keep their spaces (S2), and classes accumulate.
+- Quarto fenced divs nest by position, not fence length, and skip fenced code.
+- The MyST writer always fences a directive one longer than any inner fence: colon fences for markdown bodies, backticks for code.
+- `#| fig-width` and other cell options no longer vanish Quarto→MyST.
+- Blank lines no longer pile up after frontmatter on each hop. That bug was hidden by the harness ignoring blank lines, and corpus d09 had it baked in.
+
+Decisions worth knowing:
+
+- **MyST-only admonition kinds** (seealso, hint, danger, …) keep their kind as an extra class next to the nearest callout, so they round-trip exactly. `{dropdown}` has its own `AdmonitionKind`.
+- **Cross-document references** (for example `{ref}` from `chapter.md` to `index.md`) become links to the other page's anchor, with the heading as text, unless the target is a Quarto book. Outside books, Quarto reads a cross-document `@id` as a citation.
+- **Panel layout** (`layout-ncol` / `layout-nrow`) travels in MyST as a `layout-ncol-N` class instead of a sidecar, because MyST has no layout option.
+- **B6.** The marker comment stays for exact restore, and is now followed by a visible literal code block of the original. Without a sidecar, that block is the restore source. The RT-02 injection tests now assert the stronger containment property: dangerous text appears only inside a fence that no content line can close. A new test tries to break out with longer backtick fences.
+- **S14** renames `author`/`authors` and moves named affiliations into MyST's top-level `affiliations` list with slug ids, then back.

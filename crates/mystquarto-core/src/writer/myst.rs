@@ -93,7 +93,9 @@ impl<'a> MystWriter<'a> {
                 block.blank_lines_before,
                 i == 0 && doc.frontmatter.is_none(),
             );
-            if doc.frontmatter.is_some() && i == 0 {
+            // At least one blank line after frontmatter; the source's own
+            // blank lines already count.
+            if doc.frontmatter.is_some() && i == 0 && block.blank_lines_before == 0 {
                 out.push('\n');
             }
             let rendered = self.render_block(block, &doc.source);
@@ -136,6 +138,17 @@ impl<'a> MystWriter<'a> {
             // run, which Phase 7's diagnostics will warn about once it
             // exists.
             InlineEvent::KnitrEval(expr) => Some(format!("{{eval}}`{expr}`")),
+            // Already MyST syntax.
+            InlineEvent::AnchorReference(_) => None,
+            InlineEvent::DocumentLink {
+                text,
+                path,
+                fragment,
+            } => {
+                let path = crate::writer::swap_content_extension(Path::new(&path), "qmd", "md");
+                Some(format!("[{text}]({}{fragment})", path.display()))
+            }
+            InlineEvent::PandocInline { role, content } => Some(format!("{{{role}}}`{content}`")),
         }
     }
 
@@ -165,7 +178,7 @@ impl<'a> MystWriter<'a> {
                 body,
                 label,
             } => self.code_cell(lang, options, body, label.as_ref(), source),
-            BlockKind::StaticCode { lang, body, .. } => static_code(lang, body),
+            BlockKind::StaticCode { lang, body, attrs } => static_code(lang, body, attrs),
             BlockKind::Figure {
                 src,
                 caption,
@@ -186,24 +199,29 @@ impl<'a> MystWriter<'a> {
             } => self.admonition(*kind, title.as_deref(), body, *collapse, source),
             BlockKind::TabSet { items } => self.tab_set(items, source),
             BlockKind::Margin { body } => self.directive_wrap("margin", body, source),
-            BlockKind::Include { target, .. } => {
-                vec![
-                    format!("```{{include}} {}", myst_include_target(target).display()),
-                    "```".to_string(),
-                ]
-            }
+            BlockKind::Include { target, .. } => fenced(
+                '`',
+                &format!("{{include}} {}", myst_include_target(target).display()),
+                Vec::new(),
+                Vec::new(),
+            ),
             BlockKind::Embed { target, label } => self.embed(target, label.as_ref(), source),
-            BlockKind::Blockquote { body, attribution } => {
-                self.blockquote(body, attribution.as_deref(), source)
-            }
+            BlockKind::Blockquote {
+                body,
+                attribution,
+                class,
+            } => self.blockquote(body, attribution.as_deref(), class.as_deref(), source),
             BlockKind::Theorem {
                 thm_type,
                 label,
                 body,
             } => self.theorem(thm_type, label.as_ref(), body, source),
             BlockKind::Directive {
-                name, body, label, ..
-            } => self.directive(name, label.as_ref(), body, source),
+                name,
+                attrs,
+                body,
+                label,
+            } => self.directive(name, attrs, label.as_ref(), body, source),
             BlockKind::Comment { text, .. } => vec![format!("% {text}")],
             BlockKind::Target { label } => {
                 vec![format!("({})=", self.myst_label(source, label).raw)]
@@ -216,7 +234,7 @@ impl<'a> MystWriter<'a> {
             // diagnostic), see its docs. Non-empty is handled by the next
             // arm.
             BlockKind::Preserved { original, .. } if original.is_empty() => {
-                vec![crate::writer::render_preserved(
+                crate::writer::render_preserved(
                     &crate::writer::PreserveSink {
                         preserved: &self.preserved,
                         diagnostics: &self.diagnostics,
@@ -230,7 +248,8 @@ impl<'a> MystWriter<'a> {
                         dialect: crate::preserve::Dialect::Unknown,
                     },
                     original.clone(),
-                )]
+                    crate::writer::VisibleIn::Myst,
+                )
             }
             // Non-empty `Preserved` content is native to *this* writer's
             // dialect in every reachable pipeline path (C2 fix): a fresh
@@ -257,7 +276,7 @@ impl<'a> MystWriter<'a> {
                     || reason.contains("cycle")
                     || reason.contains("depth")
                     || reason.contains("absolute path");
-                vec![crate::writer::render_preserved(
+                crate::writer::render_preserved(
                     &crate::writer::PreserveSink {
                         preserved: &self.preserved,
                         diagnostics: &self.diagnostics,
@@ -279,7 +298,8 @@ impl<'a> MystWriter<'a> {
                         dialect: crate::preserve::Dialect::Quarto,
                     },
                     original.clone(),
-                )]
+                    crate::writer::VisibleIn::Myst,
+                )
             }
         }
     }
@@ -303,6 +323,8 @@ impl<'a> MystWriter<'a> {
         }
     }
 
+    /// mystmd reads a cell's label, caption and other options from `#|`
+    /// lines at the top of its body; tags stay a directive option.
     fn code_cell(
         &self,
         lang: &str,
@@ -311,22 +333,22 @@ impl<'a> MystWriter<'a> {
         label: Option<&Label>,
         source: &Path,
     ) -> Vec<String> {
-        let mut out = vec![format!("```{{code-cell}} {lang}")];
-        if let Some(l) = label {
-            out.push(format!(":label: {}", self.myst_label(source, l).raw));
-        }
+        let mut opts = Vec::new();
         if !options.tags.is_empty() {
-            out.push(format!(":tags: [{}]", options.tags.join(", ")));
+            opts.push(format!(":tags: [{}]", options.tags.join(", ")));
+        }
+        let mut lines = Vec::new();
+        if let Some(l) = label {
+            lines.push(format!("#| label: {}", self.myst_label(source, l).raw));
         }
         if let Some(caption) = &options.caption {
-            out.push(format!(":caption: {caption}"));
+            lines.push(format!("#| caption: {caption}"));
         }
-        if out.len() > 1 {
-            out.push(String::new());
+        for (k, v) in &options.extra {
+            lines.push(format!("#| {k}: {v}"));
         }
-        out.extend(body.iter().cloned());
-        out.push("```".to_string());
-        out
+        lines.extend(body.iter().cloned());
+        fenced('`', &format!("{{code-cell}} {lang}"), opts, lines)
     }
 
     fn figure(
@@ -340,10 +362,13 @@ impl<'a> MystWriter<'a> {
         let arg = match src {
             FigureSource::Path(p) => p.display().to_string(),
             FigureSource::CellRef { label, .. } => format!("#{}", label.raw),
+            FigureSource::Panel(subfigures) => {
+                return self.figure_panel(subfigures, caption, label, attrs, source)
+            }
         };
-        let mut out = vec![format!(":::{{figure}} {arg}")];
+        let mut opts = Vec::new();
         if let Some(l) = label {
-            out.push(format!(":label: {}", self.myst_label(source, l).raw));
+            opts.push(format!(":label: {}", self.myst_label(source, l).raw));
         }
         for (k, v) in attrs {
             if k == "id" {
@@ -352,14 +377,57 @@ impl<'a> MystWriter<'a> {
             if k == "alt" && caption.first().map(|c| c.trim()) == Some(v.trim()) {
                 continue;
             }
-            out.push(format!(":{k}: {v}"));
+            opts.push(format!(":{k}: {v}"));
+        }
+        fenced(
+            ':',
+            &format!("{{figure}} {arg}"),
+            opts,
+            self.rewrite(caption),
+        )
+    }
+
+    /// Subfigures nest inside a `{figure}`; Quarto's `layout-ncol` /
+    /// `layout-nrow` travel as a `layout-ncol-N` class, since MyST has no
+    /// such option.
+    fn figure_panel(
+        &self,
+        subfigures: &[Block],
+        caption: &[String],
+        label: Option<&Label>,
+        attrs: &std::collections::BTreeMap<String, String>,
+        source: &Path,
+    ) -> Vec<String> {
+        let mut opts = Vec::new();
+        if let Some(l) = label {
+            opts.push(format!(":label: {}", self.myst_label(source, l).raw));
+        }
+        let mut classes: Vec<String> = attrs
+            .get("class")
+            .map(|c| c.split_whitespace().map(str::to_string).collect())
+            .unwrap_or_default();
+        for (k, v) in attrs {
+            match k.as_str() {
+                "layout-ncol" | "layout-nrow" => classes.push(format!("{k}-{v}")),
+                "class" => {}
+                _ => opts.push(format!(":{k}: {v}")),
+            }
+        }
+        if !classes.is_empty() {
+            opts.push(format!(":class: {}", classes.join(" ")));
+        }
+        let mut body = Vec::new();
+        for (i, sub) in subfigures.iter().enumerate() {
+            if i > 0 {
+                body.push(String::new());
+            }
+            body.extend(self.render_block(sub, source));
         }
         if !caption.is_empty() {
-            out.push(String::new());
-            out.extend(self.rewrite(caption));
+            body.push(String::new());
+            body.extend(self.rewrite(caption));
         }
-        out.push(":::".to_string());
-        out
+        fenced(':', "{figure}", opts, body)
     }
 
     fn table(
@@ -369,31 +437,42 @@ impl<'a> MystWriter<'a> {
         label: Option<&Label>,
         source: &Path,
     ) -> Vec<String> {
-        let mut out = vec![":::{table}".to_string()];
-        if let Some(l) = label {
-            out.push(format!(":label: {}", self.myst_label(source, l).raw));
+        let label_opt = label.map(|l| format!(":label: {}", self.myst_label(source, l).raw));
+        // mystmd has no grid tables: a grid table becomes a `{list-table}`.
+        if let Some(grid) = crate::writer::CellTable::from_grid(rows) {
+            let mut opts = Vec::new();
+            if grid.header_rows > 0 {
+                opts.push(format!(":header-rows: {}", grid.header_rows));
+            }
+            opts.extend(label_opt);
+            let title = self.rewrite(caption).join(" ");
+            let open = if title.is_empty() {
+                "{list-table}".to_string()
+            } else {
+                format!("{{list-table}} {title}")
+            };
+            return fenced('`', &open, opts, grid.to_list_table());
         }
-        out.push(String::new());
-        out.extend(self.rewrite(caption));
-        if !caption.is_empty() {
-            out.push(String::new());
+        let opts: Vec<String> = label_opt.into_iter().collect();
+        let mut body = self.rewrite(caption);
+        if !body.is_empty() {
+            body.push(String::new());
         }
-        out.extend(rows.iter().cloned());
-        out.push(":::".to_string());
-        out
+        body.extend(rows.iter().cloned());
+        fenced(':', "{table}", opts, body)
     }
 
     fn math(&self, body: &[String], label: Option<&Label>, source: &Path) -> Vec<String> {
-        let mut out = vec!["```{math}".to_string()];
-        if let Some(l) = label {
-            out.push(format!(":label: {}", self.myst_label(source, l).raw));
-            out.push(String::new());
-        }
-        out.extend(body.iter().cloned());
-        out.push("```".to_string());
-        out
+        let opts: Vec<String> = label
+            .map(|l| format!(":label: {}", self.myst_label(source, l).raw))
+            .into_iter()
+            .collect();
+        fenced('`', "{math}", opts, body.to_vec())
     }
 
+    /// Typed admonitions carry their title as the argument
+    /// (`:::{warning} Careful`). A collapsible one is `:class: dropdown`,
+    /// closed unless `:open:`; a `{dropdown}` is closed by default too.
     fn admonition(
         &self,
         kind: AdmonitionKind,
@@ -403,29 +482,31 @@ impl<'a> MystWriter<'a> {
         source: &Path,
     ) -> Vec<String> {
         let name = admonition_name(kind);
-        let mut out = if let Some(title) = title {
-            vec![format!("```{{admonition}} {title}")]
-        } else {
-            vec![format!("```{{{name}}}")]
+        let open = match title {
+            Some(title) => format!("{{{name}}} {title}"),
+            None => format!("{{{name}}}"),
         };
-        if let Some(collapse) = collapse {
-            out.push(":class: dropdown".to_string());
-            out.push(format!(":open: {}", !collapse));
+        let mut opts = Vec::new();
+        if kind != AdmonitionKind::Dropdown && collapse.is_some() {
+            opts.push(":class: dropdown".to_string());
         }
-        out.extend(self.render_nested(body, source));
-        out.push("```".to_string());
-        out
+        if collapse == Some(false) {
+            opts.push(":open:".to_string());
+        }
+        fenced(':', &open, opts, self.render_nested(body, source))
     }
 
     fn tab_set(&self, items: &[crate::TabItem], source: &Path) -> Vec<String> {
-        let mut out = vec!["::::{tab-set}".to_string()];
+        let mut body = Vec::new();
         for item in items {
-            out.push(format!(":::{{tab-item}} {}", item.label));
-            out.extend(self.render_nested(&item.body, source));
-            out.push(":::".to_string());
+            body.extend(fenced(
+                ':',
+                &format!("{{tab-item}} {}", item.label),
+                Vec::new(),
+                self.render_nested(&item.body, source),
+            ));
         }
-        out.push("::::".to_string());
-        out
+        fenced(':', "{tab-set}", Vec::new(), body)
     }
 
     fn embed(&self, target: &EmbedTarget, label: Option<&Label>, source: &Path) -> Vec<String> {
@@ -433,29 +514,31 @@ impl<'a> MystWriter<'a> {
             EmbedTarget::Label(l) => l.raw.clone(),
             EmbedTarget::NotebookCell { cell_label, .. } => cell_label.raw.clone(),
         };
-        let mut out = vec![format!("```{{embed}} #{arg}")];
-        if let Some(l) = label {
-            out.push(format!(":label: {}", self.myst_label(source, l).raw));
-        }
-        out.push("```".to_string());
-        out
+        let opts: Vec<String> = label
+            .map(|l| format!(":label: {}", self.myst_label(source, l).raw))
+            .into_iter()
+            .collect();
+        fenced('`', &format!("{{embed}} #{arg}"), opts, Vec::new())
     }
 
     fn blockquote(
         &self,
         body: &[Block],
         attribution: Option<&[String]>,
+        class: Option<&str>,
         source: &Path,
     ) -> Vec<String> {
-        let mut out = vec!["```{blockquote}".to_string()];
-        out.extend(self.render_nested(body, source));
+        let mut lines = self.render_nested(body, source);
+        // MyST reads `-- Author` as the attribution only as its own
+        // paragraph.
         if let Some(attribution) = attribution {
-            for line in attribution {
-                out.push(format!("-- {line}"));
+            if !lines.is_empty() {
+                lines.push(String::new());
             }
+            lines.extend(attribution.iter().map(|l| format!("-- {l}")));
         }
-        out.push("```".to_string());
-        out
+        let name = class.unwrap_or("blockquote");
+        fenced(':', &format!("{{{name}}}"), Vec::new(), lines)
     }
 
     fn theorem(
@@ -465,36 +548,49 @@ impl<'a> MystWriter<'a> {
         body: &[Block],
         source: &Path,
     ) -> Vec<String> {
-        let mut out = vec![format!("```{{prf:{thm_type}}}")];
-        if let Some(l) = label {
-            out.push(format!(":label: {}", self.myst_label(source, l).raw));
-        }
-        out.extend(self.render_nested(body, source));
-        out.push("```".to_string());
-        out
+        let opts: Vec<String> = label
+            .map(|l| format!(":label: {}", self.myst_label(source, l).raw))
+            .into_iter()
+            .collect();
+        fenced(
+            ':',
+            &format!("{{prf:{thm_type}}}"),
+            opts,
+            self.render_nested(body, source),
+        )
     }
 
     fn directive_wrap(&self, name: &str, body: &[Block], source: &Path) -> Vec<String> {
-        let mut out = vec![format!("```{{{name}}}")];
-        out.extend(self.render_nested(body, source));
-        out.push("```".to_string());
-        out
+        fenced(
+            ':',
+            &format!("{{{name}}}"),
+            Vec::new(),
+            self.render_nested(body, source),
+        )
     }
 
     fn directive(
         &self,
         name: &str,
+        attrs: &std::collections::BTreeMap<String, String>,
         label: Option<&Label>,
         body: &[Block],
         source: &Path,
     ) -> Vec<String> {
-        let mut out = vec![format!("```{{{name}}}")];
-        if let Some(l) = label {
-            out.push(format!(":label: {}", self.myst_label(source, l).raw));
+        let mut opts: Vec<String> = label
+            .map(|l| format!(":label: {}", self.myst_label(source, l).raw))
+            .into_iter()
+            .collect();
+        for (k, v) in attrs {
+            if k != crate::reader::myst::ARGUMENT {
+                opts.push(format!(":{k}: {v}"));
+            }
         }
-        out.extend(self.render_nested(body, source));
-        out.push("```".to_string());
-        out
+        let open = match attrs.get(crate::reader::myst::ARGUMENT) {
+            Some(arg) => format!("{{{name}}} {arg}"),
+            None => format!("{{{name}}}"),
+        };
+        fenced(':', &open, opts, self.render_nested(body, source))
     }
 
     fn render_nested(&self, body: &[Block], source: &Path) -> Vec<String> {
@@ -522,27 +618,67 @@ fn admonition_name(kind: AdmonitionKind) -> &'static str {
         AdmonitionKind::Hint => "hint",
         AdmonitionKind::SeeAlso => "seealso",
         AdmonitionKind::Attention => "attention",
+        AdmonitionKind::Dropdown => "dropdown",
     }
 }
 
-fn static_code(lang: &Option<String>, body: &[String]) -> Vec<String> {
-    if lang.as_deref() == Some("mermaid") {
-        let mut out = vec!["```{mermaid}".to_string()];
-        out.extend(body.iter().cloned());
-        out.push("```".to_string());
-        return out;
+/// A directive fenced so nothing inside it can close it early: the fence is
+/// one longer than the longest same-character fence in the body. Colon
+/// fences for markdown bodies, backticks for code-like ones. Options follow
+/// the opener; a blank line separates them from the body.
+fn fenced(fence_char: char, open: &str, options: Vec<String>, body: Vec<String>) -> Vec<String> {
+    let inner = body
+        .iter()
+        .map(|l| {
+            l.trim_start()
+                .chars()
+                .take_while(|c| *c == fence_char)
+                .count()
+        })
+        .filter(|n| *n >= 3)
+        .max()
+        .unwrap_or(0);
+    let fence = fence_char.to_string().repeat((inner + 1).max(3));
+    let mut out = vec![format!("{fence}{open}")];
+    let has_options = !options.is_empty();
+    out.extend(options);
+    if has_options && !body.is_empty() {
+        out.push(String::new());
     }
-    let mut out = vec![format!("```{}", lang.as_deref().unwrap_or(""))];
-    out.extend(body.iter().cloned());
-    out.push("```".to_string());
+    out.extend(body);
+    out.push(fence);
     out
+}
+
+/// Code with no options stays a plain fence; `mermaid` is a directive; code
+/// with options (from MyST `{code-block}` or Quarto code attributes) is a
+/// `{code-block}` with MyST option names.
+fn static_code(
+    lang: &Option<String>,
+    body: &[String],
+    attrs: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    if lang.as_deref() == Some("mermaid") {
+        return fenced('`', "{mermaid}", Vec::new(), body.to_vec());
+    }
+    let opts = crate::writer::myst_code_options(attrs);
+    if opts.is_empty() {
+        return fenced(
+            '`',
+            lang.as_deref().unwrap_or(""),
+            Vec::new(),
+            body.to_vec(),
+        );
+    }
+    let open = match lang {
+        Some(l) => format!("{{code-block}} {l}"),
+        None => "{code-block}".to_string(),
+    };
+    fenced('`', &open, opts, body.to_vec())
 }
 
 fn raw(format: &str, body: &[String]) -> Vec<String> {
-    let mut out = vec![format!("```{{raw}} {format}")];
-    out.extend(body.iter().cloned());
-    out.push("```".to_string());
-    out
+    fenced('`', &format!("{{raw}} {format}"), Vec::new(), body.to_vec())
 }
 
 /// Renders every `{name}`content`` form to **modern MyST**, never
@@ -710,5 +846,84 @@ mod tests {
         let writer = MystWriter::new(&restore, Vec::new());
         let (out, _, _) = writer.write(&doc);
         assert_eq!(out.trim(), "% restored comment");
+    }
+
+    /// Counts every block in a tree, by kind name, so two parses can be
+    /// compared structurally without their line spans.
+    fn shape(blocks: &[Block], out: &mut Vec<String>) {
+        for b in blocks {
+            let name = format!("{:?}", b.kind);
+            out.push(
+                name.split(|c: char| !c.is_alphanumeric())
+                    .next()
+                    .unwrap_or("")
+                    .to_string(),
+            );
+            match &b.kind {
+                BlockKind::Admonition { body, .. }
+                | BlockKind::Margin { body }
+                | BlockKind::Blockquote { body, .. }
+                | BlockKind::Theorem { body, .. }
+                | BlockKind::Directive { body, .. } => shape(body, out),
+                BlockKind::TabSet { items } => {
+                    for item in items {
+                        shape(&item.body, out);
+                    }
+                }
+                BlockKind::Figure {
+                    src: FigureSource::Panel(subs),
+                    ..
+                } => shape(subs, out),
+                _ => {}
+            }
+        }
+    }
+
+    fn write_myst(doc: &Document) -> String {
+        let restore = RestoreMap::new();
+        MystWriter::new(&restore, Vec::new()).write(doc).0
+    }
+
+    #[test]
+    fn nested_trees_survive_write_then_parse() {
+        let sources = [
+            "::::{note}\n:::{warning} Inner\nDeep.\n:::\n::::\n",
+            "::::{grid} 2\n:::{card} A\n```python\nx = 1\n```\n:::\n:::{card} B\n:::{tip}\nNested tip.\n:::\n:::\n::::\n",
+            ":::::{tab-set}\n::::{tab-item} One\n:::{note}\n```{code-cell} python\nx\n```\n:::\n::::\n::::{tab-item} Two\nPlain.\n::::\n:::::\n",
+            "::::::{dropdown} Outer\n:::::{grid} 1\n::::{card} C\n:::{epigraph}\nQuote.\n:::\n::::\n:::::\n::::::\n",
+        ];
+        for source in sources {
+            let reader = || crate::MystReader::new(ReaderContext::new("a.md"));
+            let first = reader().read_str(source).unwrap();
+            let written = write_myst(&first);
+            let second = reader().read_str(&written).unwrap();
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            shape(&first.blocks, &mut a);
+            shape(&second.blocks, &mut b);
+            assert_eq!(a, b, "structure changed:\n{source}\n---\n{written}");
+            assert_eq!(
+                write_myst(&second),
+                written,
+                "writer is not stable on:\n{written}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_trees_survive_a_quarto_round_trip() {
+        let source = "::::{grid} 2\n:::{card} A\n::::{note} Title\nDeep.\n::::\n:::\n:::{card} B\nPlain.\n:::\n::::\n";
+        let first = crate::MystReader::new(ReaderContext::new("a.md"))
+            .read_str(source)
+            .unwrap();
+        let docs = vec![(std::path::PathBuf::from("a.md"), first.clone())];
+        let registry = crate::LabelRegistry::build(&docs).0;
+        let (qmd, _, _) = crate::writer::quarto::QuartoWriter::new(&registry).write(&first);
+        let back = crate::QuartoReader::new(ReaderContext::new("a.qmd"))
+            .read_str(&qmd)
+            .unwrap();
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        shape(&first.blocks, &mut a);
+        shape(&back.blocks, &mut b);
+        assert_eq!(a, b, "structure changed through Quarto:\n{qmd}");
     }
 }

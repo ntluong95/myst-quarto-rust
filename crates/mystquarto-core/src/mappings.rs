@@ -193,10 +193,10 @@ mod tests {
     #[test]
     fn parses_all_table_kinds() {
         let m = mappings();
-        assert_eq!(m.directive.len(), 33);
+        assert_eq!(m.directive.len(), 37);
         assert_eq!(m.structural.len(), 11);
         assert_eq!(m.role.len(), 11);
-        assert_eq!(m.inline.len(), 5);
+        assert_eq!(m.inline.len(), 7);
         assert_eq!(m.config_field.len(), 32);
         assert_eq!(m.export_format.len(), 7);
         assert_eq!(m.legacy_role.len(), 9);

@@ -954,8 +954,12 @@ fn run_content_batch(
 ) -> ContentBatch {
     match direction {
         Direction::MystToQuarto => {
-            let result =
-                pipeline::convert_myst_to_quarto_batch(content_files, notebooks, canonical_input);
+            let result = pipeline::convert_myst_to_quarto_batch_with(
+                content_files,
+                notebooks,
+                canonical_input,
+                converts_to_quarto_book(canonical_input),
+            );
             ContentBatch::MystToQuarto {
                 rendered: result.rendered,
                 errors: result.errors,
@@ -983,6 +987,18 @@ fn run_content_batch(
             }
         }
     }
+}
+
+/// `true` when `root`'s `myst.yml` becomes a Quarto book, the one project
+/// type where `@id` resolves across documents.
+fn converts_to_quarto_book(root: &Path) -> bool {
+    fs::read_to_string(root.join("myst.yml"))
+        .ok()
+        .and_then(|t| mystquarto_core::yaml::parse_mapping(&t).ok())
+        .is_some_and(|m| {
+            mystquarto_core::config::project_type::infer(&m)
+                == mystquarto_core::config::ProjectType::Book
+        })
 }
 
 /// **C1 fix.** Refuses the whole run *before any file is written or

@@ -1,0 +1,8 @@
+<!-- mystquarto-roundtrip: stable -->
+::: {#fig-panel layout-ncol=2}
+![A](a.png){#fig-a}
+
+![B](b.png){#fig-b}
+
+Panel figure
+:::

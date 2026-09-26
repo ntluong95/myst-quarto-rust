@@ -131,7 +131,13 @@ pub enum AdmonitionKind {
     SeeAlso,
     /// Reference §2: `attention` → `callout-note` (lossy, collapses).
     Attention,
+    /// MyST `{dropdown}`: a collapsible block with a title and no type.
+    Dropdown,
 }
+
+/// The HTML comment standing in for a MyST block break (`+++`) in Quarto,
+/// which has no equivalent; the reverse conversion restores the `+++`.
+pub const BLOCK_BREAK_COMMENT: &str = "mystquarto: MyST block break (+++) has no Quarto equivalent";
 
 /// One tab of a [`BlockKind::TabSet`]. Reference §2.1 "Tabs":
 /// `:::{tab-item} Label` ↔ a Quarto `## Label` heading inside
@@ -194,7 +200,7 @@ pub enum CommentStyle {
 /// cell's output, which needs the notebook's path to become
 /// `{{< embed nb.ipynb#fig-cell >}}` — the MyST source alone,
 /// `#nb:cell-label`, doesn't carry it).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FigureSource {
     /// A plain image path, e.g. `:::{figure} path/to/img.png`.
     Path(PathBuf),
@@ -203,6 +209,10 @@ pub enum FigureSource {
         label: Label,
         notebook: Option<PathBuf>,
     },
+    /// A panel of subfigures (each a [`BlockKind::Figure`]): Quarto
+    /// `::: {#fig-p layout-ncol=2}` with images inside, MyST `{figure}`
+    /// with nested figures.
+    Panel(Vec<Block>),
 }
 
 /// The shape of one [`Block`].
@@ -358,6 +368,10 @@ pub enum BlockKind {
     Blockquote {
         body: Vec<Block>,
         attribution: Option<Vec<String>>,
+        /// The MyST directive it came from (`epigraph`, `pull-quote`,
+        /// `blockquote`), kept so the reverse conversion is exact. `None`
+        /// for a plain markdown quote.
+        class: Option<String>,
     },
 
     /// Reference §2.1 "Proof / theorem": `` ```{prf:theorem} `` ↔
@@ -628,8 +642,12 @@ mod tests {
                 lines: vec!["A quote.".to_string()],
             })],
             attribution: Some(vec!["Jane Doe".to_string()]),
+            class: None,
         });
-        let BlockKind::Blockquote { body, attribution } = &blockquote.kind else {
+        let BlockKind::Blockquote {
+            body, attribution, ..
+        } = &blockquote.kind
+        else {
             panic!()
         };
         assert_eq!(body.len(), 1);

@@ -1,1 +1,56 @@
 # Lines allowed to differ after a full round trip, as `<file>: <trimmed line>`.
+# Each group is a MyST spelling the tool normalizes to an equivalent one that
+# renders the same; nothing here loses content, labels, or structure.
+
+# Legacy citation and reference roles become modern MyST `@key` / `@label`
+# (the reverse of the Quarto side's shared syntax). `[](#x)` is MyST's empty
+# link to a target, which is `@x`. `{doc}` becomes a plain link to the page.
+index.md: Cite {cite:t}`smith2020` and {cite:p}`smith2020,doe2021`. Also [@doe2021].
+index.md: Cite @smith2020 and [@smith2020; @doe2021]. Also [@doe2021].
+index.md: See {numref}`fig-main`, {ref}`sec-intro`, {eq}`eq-model`, [](#tbl-demo), and {doc}`chapter`.
+index.md: See @fig-main, @sec-intro, @eq-model, @tbl-demo, and [chapter](chapter.md).
+
+# A cross-document reference outside a Quarto book is written as a link
+# (Quarto cannot resolve `@sec-intro` across documents there); in MyST the
+# link to the heading renders the same as `{ref}`.
+chapter.md: Back to {ref}`sec-intro`.
+chapter.md: Back to [Introduction](index.md#sec-intro).
+
+# Directives with markdown bodies are written with colon fences; `:name:` is
+# the older spelling of `:label:`; options are written in a fixed order.
+index.md: ```{figure} images/fig1.png
+index.md: :::{figure} images/fig1.png
+index.md: :name: fig-main
+index.md: :label: fig-main
+index.md: :align: center
+index.md: ```{epigraph}
+index.md: :::{epigraph}
+index.md: ```
+index.md: :::
+
+# The `{math}` role is inline `$...$`.
+index.md: Inline math {math}`a^2` and $b^2$.
+index.md: Inline math $a^2$ and $b^2$.
+
+# A single-line `{list-table}` becomes a `{table}` around a pipe table
+# (a grid table, which mystmd lacks, would come back as `{list-table}`).
+index.md: ```{list-table} Demo table
+index.md: :header-rows: 1
+index.md: * - A
+index.md: - B
+index.md: * - 1
+index.md: - 2
+index.md: :::{table}
+index.md: Demo table
+index.md: | A | B |
+index.md: |---|---|
+index.md: | 1 | 2 |
+
+# `{admonition} Title` with `:class: tip` is a titled tip.
+index.md: :::{admonition} Custom title
+index.md: :class: tip
+index.md: :::{tip} Custom title
+
+# `{aside}` is MyST's alias of `{margin}`.
+index.md: :::{aside}
+index.md: :::{margin}

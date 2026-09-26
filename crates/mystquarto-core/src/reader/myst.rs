@@ -53,9 +53,16 @@ impl MystReader {
             }
             if let Some(id) = preservation_marker_id(line) {
                 flush_paragraph(&mut out, &mut para, para_start, line_no, para_blank);
-                self.push_preserved_or_marker(&mut out, id, line_no, blank)?;
+                let visible = crate::reader::visible_preserved_block(lines, i + 1);
+                self.push_preserved_or_marker(
+                    &mut out,
+                    id,
+                    line_no,
+                    blank,
+                    visible.as_ref().map(|(body, _)| body.as_slice()),
+                )?;
                 blank = 0;
-                i += 1;
+                i = visible.map_or(i + 1, |(_, end)| end + 1);
                 continue;
             }
             if let Some(label) = parse_target(line) {
@@ -186,7 +193,7 @@ impl MystReader {
         let name = frame.open.name.as_str();
         let kind = match name {
             "code-cell" => self.code_cell(frame),
-            "code" | "mermaid" => self.static_code(frame),
+            "code" | "code-block" | "sourcecode" | "mermaid" => self.static_code(frame),
             "figure" | "image" => self.figure(frame),
             "table" => table(frame),
             "math" => BlockKind::Math {
@@ -209,35 +216,64 @@ impl MystReader {
             "margin" | "aside" => BlockKind::Margin {
                 body: self.parse_owned_body(&frame.body, frame.start_line + 1)?,
             },
+            // `{admonition} Title` with `:class: tip` is a titled tip.
             "admonition" => BlockKind::Admonition {
-                kind: AdmonitionKind::Note,
+                kind: frame
+                    .options
+                    .get("class")
+                    .and_then(|c| c.split_whitespace().find_map(admonition_kind))
+                    .unwrap_or(AdmonitionKind::Note),
                 title: (!frame.open.argument.is_empty()).then(|| frame.open.argument.clone()),
                 body: self.parse_owned_body(&frame.body, frame.start_line + 1)?,
                 collapse: collapse_from_options(&frame.options),
             },
+            "dropdown" => BlockKind::Admonition {
+                kind: AdmonitionKind::Dropdown,
+                title: (!frame.open.argument.is_empty()).then(|| frame.open.argument.clone()),
+                body: self.parse_owned_body(&frame.body, frame.start_line + 1)?,
+                collapse: Some(!is_open(&frame.options)),
+            },
+            // A typed admonition takes its title from the argument
+            // (`:::{warning} Careful`) or a `:title:` option.
             n if admonition_kind(n).is_some() => BlockKind::Admonition {
                 kind: admonition_kind(n).unwrap(),
-                title: frame.options.get("title").cloned(),
+                title: (!frame.open.argument.is_empty())
+                    .then(|| frame.open.argument.clone())
+                    .or_else(|| frame.options.get("title").cloned()),
                 body: self.parse_owned_body(&frame.body, frame.start_line + 1)?,
                 collapse: collapse_from_options(&frame.options),
             },
+            "epigraph" | "pull-quote" | "blockquote" => {
+                let (quote, attribution) = split_attribution(&frame.body);
+                BlockKind::Blockquote {
+                    body: self.parse_owned_body(&quote, frame.start_line + 1)?,
+                    attribution,
+                    class: Some(name.to_string()),
+                }
+            }
             n if n.starts_with("prf:") => BlockKind::Theorem {
                 thm_type: n.trim_start_matches("prf:").to_string(),
                 label: label_option(&frame.options),
                 body: self.parse_owned_body(&frame.body, frame.start_line + 1)?,
             },
-            "grid" | "card" | "bibliography" | "tableofcontents" => BlockKind::Directive {
-                name: name.to_string(),
-                attrs: options_to_attrs(&frame.options),
-                body: self.parse_owned_body(&frame.body, frame.start_line + 1)?,
-                label: label_option(&frame.options),
-            },
-            "epigraph" | "pull-quote" | "glossary" | "list-table" | "csv-table" => {
-                BlockKind::Unmappable {
-                    original: frame.original.clone(),
-                    reason: format!("{{{name}}} has no typed target in the opposite dialect"),
+            "grid" | "card" | "grid-item" | "grid-item-card" | "bibliography"
+            | "tableofcontents" => {
+                let mut attrs = options_to_attrs(&frame.options);
+                if !frame.open.argument.is_empty() {
+                    attrs.insert(ARGUMENT.to_string(), frame.open.argument.clone());
+                }
+                BlockKind::Directive {
+                    name: name.to_string(),
+                    attrs,
+                    body: self.parse_owned_body(&frame.body, frame.start_line + 1)?,
+                    label: label_option(&frame.options),
                 }
             }
+            "list-table" => list_table(frame),
+            "glossary" | "csv-table" => BlockKind::Unmappable {
+                original: frame.original.clone(),
+                reason: format!("{{{name}}} has no typed target in the opposite dialect"),
+            },
             _ => BlockKind::Unmappable {
                 original: frame.original.clone(),
                 reason: format!("unrecognized MyST directive {{{name}}}"),
@@ -251,16 +287,27 @@ impl MystReader {
         self.parse_blocks(&refs, start)
     }
 
+    /// A cell's options come from directive options (`:label:`, `:tags:`)
+    /// and from mystmd-style `#|` lines at the top of the body.
     fn code_cell(&self, frame: &fence::DirectiveFrame) -> BlockKind {
         let mut options = cell_options_from_myst(&frame.options);
-        let (quarto_options, consumed) = parse_cell_options(&frame.body);
-        options.extra.extend(quarto_options.extra);
-        let body = frame.body[consumed..].to_vec();
+        let (cell_options, consumed) = parse_cell_options(&frame.body);
+        options.extra.extend(cell_options.extra);
+        options.tags.extend(cell_options.tags);
+        if options.caption.is_none() {
+            options.caption = cell_options.caption;
+        }
+        let label = label_option(&frame.options).or_else(|| {
+            frame.body[..consumed]
+                .iter()
+                .find_map(|l| crate::reader::parse_cell_option(l, "label"))
+                .map(Label::new)
+        });
         BlockKind::CodeCell {
             lang: frame.open.argument.clone(),
             options,
-            body,
-            label: label_option(&frame.options),
+            body: frame.body[consumed..].to_vec(),
+            label,
         }
     }
 
@@ -294,6 +341,8 @@ impl MystReader {
                 label: Label::new(raw),
                 notebook: Some(found.notebook.clone()),
             }
+        } else if frame.open.argument.is_empty() {
+            return self.figure_panel(frame);
         } else {
             FigureSource::Path(PathBuf::from(&frame.open.argument))
         };
@@ -302,6 +351,54 @@ impl MystReader {
             caption: trim_blank_lines(&frame.body),
             label: label_option(&frame.options),
             attrs: options_to_attrs(&frame.options),
+        }
+    }
+
+    /// A `{figure}` without an image argument holding nested figures: a
+    /// panel. `:class: layout-ncol-2` carries Quarto's panel layout.
+    fn figure_panel(&self, frame: &fence::DirectiveFrame) -> BlockKind {
+        let Ok(blocks) = self.parse_owned_body(&frame.body, frame.start_line + 1) else {
+            return BlockKind::Unmappable {
+                original: frame.original.clone(),
+                reason: "figure panel could not be parsed".to_string(),
+            };
+        };
+        let (subfigures, rest): (Vec<Block>, Vec<Block>) = blocks
+            .into_iter()
+            .partition(|b| matches!(b.kind, BlockKind::Figure { .. }));
+        let mut caption = Vec::new();
+        for b in &rest {
+            if let BlockKind::Paragraph { lines } = &b.kind {
+                if !caption.is_empty() {
+                    caption.push(String::new());
+                }
+                caption.extend(lines.iter().cloned());
+            }
+        }
+        let mut attrs = options_to_attrs(&frame.options);
+        if let Some(class) = attrs.remove("class") {
+            let mut kept = Vec::new();
+            for c in class.split_whitespace() {
+                match c
+                    .strip_prefix("layout-ncol-")
+                    .map(|n| ("layout-ncol", n))
+                    .or_else(|| c.strip_prefix("layout-nrow-").map(|n| ("layout-nrow", n)))
+                {
+                    Some((k, n)) => {
+                        attrs.insert(k.to_string(), n.to_string());
+                    }
+                    None => kept.push(c),
+                }
+            }
+            if !kept.is_empty() {
+                attrs.insert("class".to_string(), kept.join(" "));
+            }
+        }
+        BlockKind::Figure {
+            src: FigureSource::Panel(subfigures),
+            caption,
+            label: label_option(&frame.options),
+            attrs,
         }
     }
 
@@ -348,6 +445,10 @@ impl MystReader {
         Ok(BlockKind::TabSet { items })
     }
 }
+
+/// Where a generic directive's argument (`{grid} 2`, `{card} Title`) is
+/// kept in its attrs.
+pub(crate) const ARGUMENT: &str = "argument";
 
 fn push_with_target(
     out: &mut Vec<Block>,
@@ -438,6 +539,7 @@ impl MystReader {
         id: &str,
         line: u32,
         blank: u8,
+        visible: Option<&[String]>,
     ) -> Result<(), ReaderError> {
         use crate::preserve::Dialect;
 
@@ -469,6 +571,18 @@ impl MystReader {
                 BlockKind::Preserved {
                     original: original.clone(),
                     code: "preserved-foreign-dialect",
+                },
+                line,
+                line,
+                blank,
+            ));
+        } else if let Some(visible) = visible.filter(|v| !v.is_empty()) {
+            // No sidecar entry, but the visible copy right after the marker
+            // holds the original, in the other dialect: pass it through.
+            out.push(block(
+                BlockKind::Preserved {
+                    original: visible.to_vec(),
+                    code: "preserved-visible-copy",
                 },
                 line,
                 line,
@@ -522,6 +636,31 @@ fn table(frame: &fence::DirectiveFrame) -> BlockKind {
     }
 }
 
+/// `{list-table} Caption` with `:header-rows:` and `:label:` becomes a
+/// pipe table, or a grid table when a cell spans several lines.
+fn list_table(frame: &fence::DirectiveFrame) -> BlockKind {
+    let header_rows = frame
+        .options
+        .get("header-rows")
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or(0);
+    let table = crate::writer::CellTable::from_list_table(&frame.body, header_rows);
+    if table.rows.is_empty() {
+        return BlockKind::Unmappable {
+            original: frame.original.clone(),
+            reason: "{list-table} has no rows".to_string(),
+        };
+    }
+    BlockKind::Table {
+        caption: (!frame.open.argument.is_empty())
+            .then(|| frame.open.argument.clone())
+            .into_iter()
+            .collect(),
+        rows: table.to_markdown(),
+        label: label_option(&frame.options),
+    }
+}
+
 fn parse_dollar_math(lines: &[&str], start: usize) -> (BlockKind, usize) {
     let mut body = Vec::new();
     let mut i = start + 1;
@@ -556,15 +695,30 @@ fn options_to_attrs(options: &BTreeMap<String, String>) -> Attrs {
         .collect()
 }
 
+fn is_open(options: &BTreeMap<String, String>) -> bool {
+    matches!(options.get("open").map(String::as_str), Some("true" | ""))
+}
+
 fn collapse_from_options(options: &BTreeMap<String, String>) -> Option<bool> {
-    if options.get("class").is_some_and(|v| v.contains("dropdown")) {
-        Some(!matches!(
-            options.get("open").map(String::as_str),
-            Some("true")
-        ))
-    } else {
-        None
-    }
+    options
+        .get("class")
+        .is_some_and(|v| v.split_whitespace().any(|c| c == "dropdown"))
+        .then(|| !is_open(options))
+}
+
+/// Splits trailing `-- Author` lines off a quote body.
+fn split_attribution(body: &[String]) -> (Vec<String>, Option<Vec<String>>) {
+    let body = trim_blank_lines(body);
+    let start = body
+        .iter()
+        .rposition(|l| !l.trim_start().starts_with("-- "))
+        .map_or(0, |i| i + 1);
+    let attribution: Vec<String> = body[start..]
+        .iter()
+        .map(|l| l.trim_start().trim_start_matches("-- ").to_string())
+        .collect();
+    let quote = trim_blank_lines(&body[..start]);
+    (quote, (!attribution.is_empty()).then_some(attribution))
 }
 
 fn admonition_kind(name: &str) -> Option<AdmonitionKind> {
@@ -579,6 +733,7 @@ fn admonition_kind(name: &str) -> Option<AdmonitionKind> {
         "hint" => Some(AdmonitionKind::Hint),
         "seealso" => Some(AdmonitionKind::SeeAlso),
         "attention" => Some(AdmonitionKind::Attention),
+        "dropdown" => Some(AdmonitionKind::Dropdown),
         _ => None,
     }
 }

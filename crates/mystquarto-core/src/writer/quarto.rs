@@ -27,9 +27,40 @@ pub struct QuartoWriter<'a> {
     /// and a preserved/unmappable construct can appear at any depth.
     preserved: RefCell<BTreeMap<String, PreservedEntry>>,
     diagnostics: RefCell<Vec<Diagnostic>>,
+    /// Set when the target project cannot resolve `@id` across documents:
+    /// id -> (defining document, link text).
+    document_links: BTreeMap<String, (std::path::PathBuf, String)>,
 }
 
 impl<'a> QuartoWriter<'a> {
+    /// Renders references to labels another document defines as links to
+    /// that document's anchor (see
+    /// `crate::pipeline::convert_myst_to_quarto_batch_with`).
+    #[must_use]
+    pub fn with_document_links(
+        mut self,
+        links: BTreeMap<String, (std::path::PathBuf, String)>,
+    ) -> Self {
+        self.document_links = links;
+        self
+    }
+
+    /// `@id`, or a link when `id` lives in another document and the target
+    /// project cannot resolve cross-document references.
+    fn reference(&self, source: &Path, id: &str) -> String {
+        match self.document_links.get(id) {
+            Some((file, text)) if file != source => {
+                let target = crate::writer::swap_content_extension(
+                    &relative_path(source.parent().unwrap_or(Path::new("")), file),
+                    "md",
+                    "qmd",
+                );
+                format!("[{text}]({}#{id})", target.display())
+            }
+            _ => format!("@{id}"),
+        }
+    }
+
     #[must_use]
     pub fn new(registry: &'a LabelRegistry) -> Self {
         Self {
@@ -37,6 +68,7 @@ impl<'a> QuartoWriter<'a> {
             known_labels: known_reference_labels(registry),
             preserved: RefCell::new(BTreeMap::new()),
             diagnostics: RefCell::new(Vec::new()),
+            document_links: BTreeMap::new(),
         }
     }
 
@@ -68,8 +100,10 @@ impl<'a> QuartoWriter<'a> {
                 block.blank_lines_before,
                 i == 0 && doc.frontmatter.is_none(),
             );
-            if doc.frontmatter.is_some() && i == 0 {
-                out.push('\n'); // one blank line after frontmatter, always
+            // At least one blank line after frontmatter; the source's own
+            // blank lines already count.
+            if doc.frontmatter.is_some() && i == 0 && block.blank_lines_before == 0 {
+                out.push('\n');
             }
             let rendered = self.render_block(block, &doc.source);
             out.push_str(&rendered.join("\n"));
@@ -104,14 +138,30 @@ impl<'a> QuartoWriter<'a> {
             // invokes `render` for `Citation` (it copies modern citation
             // syntax through verbatim itself). Exists for exhaustiveness.
             InlineEvent::Citation(_) => None,
-            InlineEvent::CrossReference(key) => Some(format!(
-                "@{}",
-                self.registry.resolve_reference(source, &key)
-            )),
+            InlineEvent::CrossReference(key) => {
+                Some(self.reference(source, &self.registry.resolve_reference(source, &key)))
+            }
             InlineEvent::LegacyRole { role, target } => {
-                Some(render_role_to_quarto(&role, &target, self.registry, source))
+                let rendered = render_role_to_quarto(&role, &target, self.registry, source);
+                Some(match (role.as_str(), rendered.strip_prefix('@')) {
+                    ("numref" | "ref" | "eq", Some(id)) => self.reference(source, id),
+                    _ => rendered,
+                })
             }
             InlineEvent::JupyterEval { engine, expr } => Some(format!("`{{{engine}}} {expr}`")),
+            InlineEvent::AnchorReference(key) => {
+                Some(self.reference(source, &self.registry.resolve_reference(source, &key)))
+            }
+            InlineEvent::DocumentLink {
+                text,
+                path,
+                fragment,
+            } => {
+                let path = crate::writer::swap_content_extension(Path::new(&path), "md", "qmd");
+                Some(format!("[{text}]({}{fragment})", path.display()))
+            }
+            // Already Quarto syntax.
+            InlineEvent::PandocInline { .. } => None,
             InlineEvent::KnitrEval(expr) => {
                 // knitr has no MyST origin (MyST only reads modern
                 // `{eval}` roles, caught above as JupyterEval via
@@ -160,9 +210,11 @@ impl<'a> QuartoWriter<'a> {
             BlockKind::Margin { body } => self.wrapped_div("column-margin", body, source),
             BlockKind::Include { target, .. } => vec![include_shortcode(target)],
             BlockKind::Embed { target, label } => self.embed(target, label.as_ref(), source),
-            BlockKind::Blockquote { body, attribution } => {
-                self.blockquote(body, attribution.as_deref(), source)
-            }
+            BlockKind::Blockquote {
+                body,
+                attribution,
+                class,
+            } => self.blockquote(body, attribution.as_deref(), class.as_deref(), source),
             BlockKind::Theorem {
                 thm_type,
                 label,
@@ -177,9 +229,7 @@ impl<'a> QuartoWriter<'a> {
             BlockKind::Comment { text, .. } => vec![format!("<!-- {text} -->")],
             BlockKind::Target { .. } => Vec::new(), // no general Quarto anchor; see writer/mod.rs docs
             BlockKind::Raw { format, body } => raw(format, body),
-            BlockKind::BlockBreak => vec![
-                "<!-- mystquarto: MyST block break (+++) has no Quarto equivalent -->".to_string(),
-            ],
+            BlockKind::BlockBreak => vec![format!("<!-- {} -->", crate::ir::BLOCK_BREAK_COMMENT)],
             // Empty `original` is the "missing-sidecar-entry"/"foreign
             // dialect, but no real content to fall back to" degrade —
             // `render_preserved` handles it (a fresh marker + a Warning
@@ -187,7 +237,7 @@ impl<'a> QuartoWriter<'a> {
             // passes through verbatim — see `writer::myst::MystWriter`'s
             // identical arm for why that's correct (C2 fix).
             BlockKind::Preserved { original, .. } if original.is_empty() => {
-                vec![crate::writer::render_preserved(
+                crate::writer::render_preserved(
                     &crate::writer::PreserveSink {
                         preserved: &self.preserved,
                         diagnostics: &self.diagnostics,
@@ -201,7 +251,8 @@ impl<'a> QuartoWriter<'a> {
                         dialect: crate::preserve::Dialect::Unknown,
                     },
                     original.clone(),
-                )]
+                    crate::writer::VisibleIn::Quarto,
+                )
             }
             BlockKind::Preserved { original, .. } => original.clone(),
             // `QuartoWriter`'s sole caller (`convert_myst_to_quarto_batch`)
@@ -210,7 +261,7 @@ impl<'a> QuartoWriter<'a> {
                     || reason.contains("cycle")
                     || reason.contains("depth")
                     || reason.contains("absolute path");
-                vec![crate::writer::render_preserved(
+                crate::writer::render_preserved(
                     &crate::writer::PreserveSink {
                         preserved: &self.preserved,
                         diagnostics: &self.diagnostics,
@@ -232,7 +283,8 @@ impl<'a> QuartoWriter<'a> {
                         dialect: crate::preserve::Dialect::Myst,
                     },
                     original.clone(),
-                )]
+                    crate::writer::VisibleIn::Quarto,
+                )
             }
         }
     }
@@ -267,13 +319,13 @@ impl<'a> QuartoWriter<'a> {
         if let Some(id) = label.and_then(|l| self.registry.quarto_id(source, l)) {
             out.push(format!("#| label: {id}"));
         }
+        if let Some(caption) = &options.caption {
+            out.push(format!("#| fig-cap: \"{}\"", escape_quoted(caption)));
+        }
         for tag in &options.tags {
             if let Some(opt) = tag_to_cell_option(tag) {
                 out.push(opt.to_string());
             }
-        }
-        if let Some(caption) = &options.caption {
-            out.push(format!("#| fig-cap: \"{}\"", escape_quoted(caption)));
         }
         for (k, v) in &options.extra {
             out.push(format!("#| {k}: {v}"));
@@ -327,6 +379,33 @@ impl<'a> QuartoWriter<'a> {
                     .unwrap_or_default();
                 vec![format!("{{{{< embed {notebook}#{embed_id} >}}}}")]
             }
+            FigureSource::Panel(subfigures) => {
+                let mut open = String::from("::: {");
+                if let Some(id) = &id {
+                    open.push_str(&format!("#{id}"));
+                }
+                for (k, v) in attrs {
+                    if k == "class" {
+                        continue;
+                    }
+                    open.push(' ');
+                    open.push_str(&attr_pair(k, v));
+                }
+                let open = format!("{}}}", open.replacen("{ ", "{", 1));
+                let mut out = vec![open];
+                for (i, sub) in subfigures.iter().enumerate() {
+                    if i > 0 {
+                        out.push(String::new());
+                    }
+                    out.extend(self.render_block(sub, source));
+                }
+                if !caption.is_empty() {
+                    out.push(String::new());
+                    out.extend(self.rewrite(caption, source));
+                }
+                out.push(":::".to_string());
+                out
+            }
             FigureSource::Path(path) => {
                 let caption_text = self.rewrite(caption, source).join(" ");
                 let path = path.display().to_string();
@@ -349,7 +428,11 @@ impl<'a> QuartoWriter<'a> {
                         attr_parts.push(format!("#{id}"));
                     }
                     for (k, v) in attrs {
-                        attr_parts.push(format!("{k}=\"{}\"", escape_quoted(v)));
+                        // `alt` repeats the caption the image already shows.
+                        if k == "id" || (k == "alt" && v.trim() == caption_text.trim()) {
+                            continue;
+                        }
+                        attr_parts.push(attr_pair(k, v));
                     }
                     let attr_str = if attr_parts.is_empty() {
                         String::new()
@@ -394,6 +477,10 @@ impl<'a> QuartoWriter<'a> {
         out
     }
 
+    /// Quarto has five callout types. A MyST-only kind (`hint`,
+    /// `seealso`, `danger`, …) maps to the nearest one and keeps its own name
+    /// as an extra class, so the reverse conversion restores it exactly. A
+    /// `{dropdown}` is a collapsed note with a `.dropdown` class.
     fn admonition(
         &self,
         kind: AdmonitionKind,
@@ -404,6 +491,9 @@ impl<'a> QuartoWriter<'a> {
     ) -> Vec<String> {
         let class = admonition_class(kind);
         let mut header = format!("::: {{.{class}");
+        if let Some(extra) = admonition_extra_class(kind) {
+            header.push_str(&format!(" .{extra}"));
+        }
         if let Some(title) = title {
             header.push_str(&format!(" title=\"{}\"", escape_quoted(title)));
         }
@@ -462,23 +552,38 @@ impl<'a> QuartoWriter<'a> {
         vec![format!("{{{{< embed {prefix}#{cell_id} >}}}}")]
     }
 
+    /// A markdown quote; an epigraph or pull quote is wrapped in a div
+    /// carrying its MyST name so the reverse conversion is exact.
     fn blockquote(
         &self,
         body: &[Block],
         attribution: Option<&[String]>,
+        class: Option<&str>,
         source: &Path,
     ) -> Vec<String> {
-        let mut out: Vec<String> = self
+        let mut quote: Vec<String> = self
             .render_nested(body, source)
             .into_iter()
-            .map(|l| format!("> {l}"))
+            .map(|l| {
+                if l.is_empty() {
+                    ">".to_string()
+                } else {
+                    format!("> {l}")
+                }
+            })
             .collect();
-        if let Some(attribution) = attribution {
-            for line in attribution {
-                out.push(format!("> \u{2014} {line}"));
-            }
+        for line in attribution.unwrap_or_default() {
+            quote.push(format!("> \u{2014} {line}"));
         }
-        out
+        match class {
+            Some(class) => {
+                let mut out = vec![format!("::: {{.{class}}}")];
+                out.extend(quote);
+                out.push(":::".to_string());
+                out
+            }
+            None => quote,
+        }
     }
 
     fn theorem(
@@ -512,6 +617,13 @@ impl<'a> QuartoWriter<'a> {
         if matches!(name, "bibliography" | "tableofcontents") {
             return Vec::new();
         }
+        match name {
+            "grid" => return self.grid(attrs, body, source),
+            "card" | "grid-item" | "grid-item-card" => {
+                return self.grid_item(name, attrs, body, &[], source)
+            }
+            _ => {}
+        }
         let id = label.and_then(|l| self.registry.quarto_id(source, l));
         let mut attr_parts = vec![format!(".{name}")];
         if let Some(id) = id {
@@ -529,6 +641,90 @@ impl<'a> QuartoWriter<'a> {
     fn render_nested(&self, body: &[Block], source: &Path) -> Vec<String> {
         crate::writer::render_body(body, |b| self.render_block(b, source))
     }
+
+    /// MyST `{grid} N` -> a Quarto CSS grid whose items span `12/N` of the
+    /// 12 columns from the `md` breakpoint up (full width on small screens).
+    /// A responsive MyST argument (`1 2 2 3`, xs..lg) uses its `md` value.
+    fn grid(&self, attrs: &BTreeMap<String, String>, body: &[Block], source: &Path) -> Vec<String> {
+        let columns = attrs
+            .get(crate::reader::myst::ARGUMENT)
+            .map(|a| {
+                let n: Vec<usize> = a
+                    .split_whitespace()
+                    .filter_map(|x| x.parse().ok())
+                    .collect();
+                n.get(2).or_else(|| n.last()).copied().unwrap_or(1)
+            })
+            .unwrap_or(1)
+            .clamp(1, 12);
+        let span = format!("g-col-md-{}", 12 / columns);
+        let classes = ["g-col-12", span.as_str()];
+        let mut out = vec!["::: {.grid}".to_string()];
+        for (i, block) in body.iter().enumerate() {
+            if i > 0 {
+                out.push(String::new());
+            }
+            match &block.kind {
+                BlockKind::Directive {
+                    name, attrs, body, ..
+                } if matches!(name.as_str(), "card" | "grid-item" | "grid-item-card") => {
+                    out.extend(self.grid_item(name, attrs, body, &classes, source));
+                }
+                _ => out.extend(self.render_block(block, source)),
+            }
+        }
+        out.push(":::".to_string());
+        out
+    }
+
+    /// A grid item or card. A card keeps a `.card` class and its title as a
+    /// bold first line, so the reverse conversion restores both.
+    fn grid_item(
+        &self,
+        name: &str,
+        attrs: &BTreeMap<String, String>,
+        body: &[Block],
+        layout: &[&str],
+        source: &Path,
+    ) -> Vec<String> {
+        let mut classes: Vec<&str> = Vec::new();
+        if name != "grid-item" {
+            classes.push("card");
+        }
+        classes.extend(layout);
+        let open = if classes.is_empty() {
+            "::: {}".to_string()
+        } else {
+            format!("::: {{.{}}}", classes.join(" ."))
+        };
+        let mut out = vec![open];
+        if let Some(title) = attrs.get(crate::reader::myst::ARGUMENT) {
+            out.push(format!("**{title}**"));
+            out.push(String::new());
+        }
+        out.extend(self.render_nested(body, source));
+        out.push(":::".to_string());
+        out
+    }
+}
+
+/// `to` relative to the directory `from` (both under the same root).
+fn relative_path(from: &Path, to: &Path) -> std::path::PathBuf {
+    let from: Vec<_> = from.components().collect();
+    let to_parts: Vec<_> = to.components().collect();
+    let common = from
+        .iter()
+        .zip(&to_parts)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut out = std::path::PathBuf::new();
+    for _ in common..from.len() {
+        out.push("..");
+    }
+    for part in &to_parts[common..] {
+        out.push(part);
+    }
+    out
 }
 
 /// Resolves the single crossref id an embedded notebook cell's output must
@@ -587,12 +783,39 @@ fn escape_html_attr(s: &str) -> String {
     escape_html_text(s).replace('"', "&quot;")
 }
 
+/// `k=v` when `v` is a plain token, else `k="v"` with quotes escaped.
+fn attr_pair(k: &str, v: &str) -> String {
+    let bare = !v.is_empty()
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '%' | '.' | '-' | '_' | '/'));
+    if bare {
+        format!("{k}={v}")
+    } else {
+        format!("{k}=\"{}\"", escape_quoted(v))
+    }
+}
+
+/// The MyST kind kept as an extra class when Quarto has no callout of that
+/// name.
+fn admonition_extra_class(kind: AdmonitionKind) -> Option<&'static str> {
+    match kind {
+        AdmonitionKind::Hint => Some("hint"),
+        AdmonitionKind::SeeAlso => Some("seealso"),
+        AdmonitionKind::Attention => Some("attention"),
+        AdmonitionKind::Danger => Some("danger"),
+        AdmonitionKind::Error => Some("error"),
+        AdmonitionKind::Dropdown => Some("dropdown"),
+        _ => None,
+    }
+}
+
 fn admonition_class(kind: AdmonitionKind) -> &'static str {
     match kind {
         AdmonitionKind::Note
         | AdmonitionKind::Hint
         | AdmonitionKind::SeeAlso
-        | AdmonitionKind::Attention => "callout-note",
+        | AdmonitionKind::Attention
+        | AdmonitionKind::Dropdown => "callout-note",
         AdmonitionKind::Warning => "callout-warning",
         AdmonitionKind::Tip => "callout-tip",
         AdmonitionKind::Important | AdmonitionKind::Danger | AdmonitionKind::Error => {
@@ -612,24 +835,28 @@ fn tag_to_cell_option(tag: &str) -> Option<&'static str> {
     }
 }
 
+/// `mermaid` stays a diagram; code with options gets Quarto's attributes
+/// (`code-line-numbers`, `filename`).
 fn static_code(
     lang: &Option<String>,
     body: &[String],
     attrs: &BTreeMap<String, String>,
 ) -> Vec<String> {
-    if lang.as_deref() == Some("mermaid") {
-        let mut out = vec!["```{mermaid}".to_string()];
-        out.extend(body.iter().cloned());
-        out.push("```".to_string());
-        return out;
-    }
-    let mut open = String::from("```{");
-    open.push_str(&format!(".{}", lang.as_deref().unwrap_or("text")));
-    for (k, v) in attrs {
-        open.push_str(&format!(" {k}=\"{v}\""));
-    }
-    open.push('}');
-    let mut out = vec![open];
+    let mut out = if lang.as_deref() == Some("mermaid") {
+        vec!["```{mermaid}".to_string()]
+    } else {
+        let quarto_attrs = crate::writer::quarto_code_attrs(attrs);
+        if quarto_attrs.is_empty() {
+            vec![format!("```{}", lang.as_deref().unwrap_or(""))]
+        } else {
+            let mut open = format!("```{{.{}", lang.as_deref().unwrap_or("text"));
+            for (k, v) in &quarto_attrs {
+                open.push_str(&format!(" {k}=\"{}\"", escape_quoted(v)));
+            }
+            open.push('}');
+            vec![open]
+        }
+    };
     out.extend(body.iter().cloned());
     out.push("```".to_string());
     out
@@ -686,6 +913,7 @@ fn render_role_to_quarto(
         "del" | "strike" => format!("~~{target}~~"),
         "u" | "underline" => format!("[{target}]{{.underline}}"),
         "sc" | "smallcaps" => format!("[{target}]{{.smallcaps}}"),
+        "math" => format!("${target}$"),
         "sub" => format!("~{target}~"),
         "sup" => format!("^{target}^"),
         "kbd" => format!("[{target}]{{.kbd}}"),

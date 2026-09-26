@@ -1,0 +1,10 @@
+<!-- mystquarto-roundtrip: stable -->
+---
+title: T
+author:
+  - name: Jane Smith
+    affiliations:
+      - Uni
+---
+
+Text.

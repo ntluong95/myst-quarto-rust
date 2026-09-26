@@ -1,0 +1,8 @@
+<!-- mystquarto-roundtrip: normalized -->
+::: {.callout-note .dropdown collapse="true" title="Click me"}
+Hidden content.
+:::
+
+::: {.callout-note collapse="true"}
+Collapsed note.
+:::

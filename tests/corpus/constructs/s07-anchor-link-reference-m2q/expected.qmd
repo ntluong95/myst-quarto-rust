@@ -1,0 +1,6 @@
+| A |
+|---|
+| 1 |
+: Demo {#tbl-demo}
+
+See @tbl-demo.

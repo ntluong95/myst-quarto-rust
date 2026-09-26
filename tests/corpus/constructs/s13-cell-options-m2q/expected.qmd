@@ -1,0 +1,7 @@
+```{python}
+#| label: fig-py
+#| fig-cap: "Python fig"
+#| echo: false
+#| fig-width: 5
+x = 1
+```

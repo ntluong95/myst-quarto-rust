@@ -1,0 +1,4 @@
+<!-- mystquarto-roundtrip: stable -->
+::: {.callout-warning title="Careful"}
+Warning with title.
+:::

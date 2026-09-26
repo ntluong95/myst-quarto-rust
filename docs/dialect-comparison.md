@@ -78,23 +78,27 @@ Phase 7's diagnostics.
 | tip | callout-tip | ✅ | Only these five overlap |
 | important | callout-important | ✅ | Only these five overlap |
 | caution | callout-caution | ✅ | Only these five overlap |
-| danger | callout-important | ⚠️ | Collapse to nearest of the five: danger/error→important, hint/seealso/attention→note. Lossy — warn |
-| error | callout-important | ⚠️ | Collapse to nearest of the five: danger/error→important, hint/seealso/attention→note. Lossy — warn |
-| hint | callout-note | ⚠️ | Collapse to nearest of the five: danger/error→important, hint/seealso/attention→note. Lossy — warn |
-| seealso | callout-note | ⚠️ | Collapse to nearest of the five: danger/error→important, hint/seealso/attention→note. Lossy — warn |
-| attention | callout-note | ⚠️ | Collapse to nearest of the five: danger/error→important, hint/seealso/attention→note. Lossy — warn |
-| admonition (custom title) | callout-note title="My Title" | ✅ |  |
+| danger | callout-important | ⚠️ | Nearest of the five callouts plus the MyST kind as an extra class (`.callout-note .seealso`); rendered as the nearest callout, restored exactly on the way back |
+| error | callout-important | ⚠️ | Nearest of the five callouts plus the MyST kind as an extra class (`.callout-note .seealso`); rendered as the nearest callout, restored exactly on the way back |
+| hint | callout-note | ⚠️ | Nearest of the five callouts plus the MyST kind as an extra class (`.callout-note .seealso`); rendered as the nearest callout, restored exactly on the way back |
+| seealso | callout-note | ⚠️ | Nearest of the five callouts plus the MyST kind as an extra class (`.callout-note .seealso`); rendered as the nearest callout, restored exactly on the way back |
+| attention | callout-note | ⚠️ | Nearest of the five callouts plus the MyST kind as an extra class (`.callout-note .seealso`); rendered as the nearest callout, restored exactly on the way back |
+| admonition Title + :class: tip | callout-tip title="Title" | ✅ |  |
 | :class: dropdown + :open: | collapse="true" / collapse="false" | ⚠️ | Inverted polarity: MyST :open: true ≙ Quarto collapse="false" |
-| margin | column-margin | ✅ | MyST {aside} and {margin} both map here; reverse picks {aside} |
-| aside | column-margin | ✅ | MyST {aside} and {margin} both map here; reverse picks {aside} |
-| epigraph | — | ❌ | Warn + preserve |
-| pull-quote | — | ❌ | Warn + preserve |
+| margin | column-margin | ✅ | MyST {aside} and {margin} both map here; reverse picks {margin} |
+| aside | column-margin | ✅ | MyST {aside} and {margin} both map here; reverse picks {margin} |
+| epigraph | ::: {.epigraph} + > quote | ✅ | Blockquote in a div named after the directive; `-- Author` ↔ `> — Author` |
+| pull-quote | ::: {.pull-quote} + > quote | ✅ | Blockquote in a div named after the directive; `-- Author` ↔ `> — Author` |
 | mermaid | mermaid | ✅ | Identical fence |
 | bibliography | — | ⚠️ | Drop the directive; ensure bibliography: is set in config |
 | tableofcontents | — | ⚠️ | Drop the directive |
 | glossary | — | ❌ | Warn + preserve |
-| grid | grid | ⚠️ | Quarto classes are Bootstrap, not semantic. Approximate |
-| card | card | ⚠️ | Quarto classes are Bootstrap, not semantic. Approximate |
+| grid | grid | ⚠️ | {grid} N ↔ .grid with .g-col-12 .g-col-md-(12/N) items; responsive arguments use their md value |
+| card | card | ⚠️ | {card} Title ↔ .card item with a **Title** first line |
+| dropdown Title | callout-note .dropdown collapse="true" title="Title" | ✅ | Collapsed note in Quarto; the .dropdown class restores {dropdown} |
+| list-table Caption + :header-rows: + :label: | pipe table + : Caption {#tbl-x} | ⚠️ | Grid table when a cell spans several lines; single-line tables return as {table} around a pipe table, grid tables as {list-table} |
+| code-block lang + :linenos: :emphasize-lines: :caption: | ```{.lang code-line-numbers="true\|1,3" filename="caption"} | ✅ | Emphasized lines imply line numbers |
+| figure + nested figures + :class: layout-ncol-N | ::: {#fig-p layout-ncol=N} with subfigure images | ✅ | Panel figure; MyST has no layout option, so the layout travels as a class |
 <!-- end generated (directive) -->
 
 ### 2.1 Structural constructs (hand-written transforms)
@@ -263,15 +267,17 @@ one table, role rows first.
 | eval | `{python} expr` | ✅ | Python |
 | eval | `{r} expr` | ✅ | R, Jupyter kernel |
 | — | `r expr` | ❌ | knitr-only. See §6 |
-| abbr | — | ❌ | Emit raw <abbr> + warn |
+| abbr | <abbr title="expansion">term</abbr> | ✅ | Raw HTML in Quarto; read back as {abbr}`term (expansion)` |
 | del | ~~x~~ | ✅ | Also plain ~~x~~ syntax in MyST |
 | u | [x]{.underline} | ✅ |  |
 | sc | [x]{.smallcaps} | ✅ |  |
 | sub | ~x~ | ✅ | Also plain ~x~ syntax in MyST |
 | sup | ^x^ | ✅ | Also plain ^x^ syntax in MyST |
-| kbd | [Ctrl-C]{.kbd} | ⚠️ | No Quarto semantic |
+| kbd | [Ctrl-C]{.kbd} | ✅ | A styled span in Quarto; read back as {kbd} |
 | doc | — | ❌ | read-only → [path](path.qmd) |
 | [text](./other.md) | [text](./other.qmd) | ✅ | Extension rewrite |
+| [](#label) | @label | ✅ | MyST's empty link to a target is a cross-reference |
+| {math}`x` | $x$ | ✅ | Returns as $x$, which MyST also reads |
 | [](./references.bib) | [references.bib](./references.bib) | ⚠️ | MyST auto-fills text; Quarto renders empty |
 | [^label] + [^label]: text | [^label] + [^label]: text | ✅ | identical |
 | [Label]: https://url | [Label]: https://url | ✅ | identical |

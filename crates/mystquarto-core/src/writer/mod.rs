@@ -76,6 +76,20 @@ pub(crate) struct PreservedDisposition {
     pub dialect: crate::preserve::Dialect,
 }
 
+/// Which dialect a preserved construct's visible copy is written in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VisibleIn {
+    Quarto,
+    Myst,
+}
+
+/// The class marking the visible copy of a preserved construct.
+pub(crate) const PRESERVED_CLASS: &str = "mystquarto-preserved";
+
+/// The marker comment (which the reverse conversion restores from exactly)
+/// followed by the construct's original source as a visible code block, so
+/// content without a target-dialect equivalent never disappears from the
+/// rendered page.
 pub(crate) fn render_preserved(
     sink: &PreserveSink,
     file: &Path,
@@ -83,7 +97,8 @@ pub(crate) fn render_preserved(
     kind: &str,
     disposition: PreservedDisposition,
     original: Vec<String>,
-) -> String {
+    visible_in: VisibleIn,
+) -> Vec<String> {
     let PreservedDisposition {
         code,
         severity,
@@ -100,11 +115,14 @@ pub(crate) fn render_preserved(
             .with_file(file.to_path_buf())
             .with_span(span),
         );
-        return "<!-- mystquarto: preservation entry missing, original content unavailable -->"
-            .to_string();
+        return vec![
+            "<!-- mystquarto: preservation entry missing, original content unavailable -->"
+                .to_string(),
+        ];
     }
 
     let id = preserve::entry_id(&original);
+    let visible = visible_copy(&original, visible_in);
     sink.preserved.borrow_mut().insert(
         id.clone(),
         PreservedEntry {
@@ -126,7 +144,29 @@ pub(crate) fn render_preserved(
         .with_span(span)
         .with_preserved(id.clone()),
     );
-    preserve::marker(code, kind, &id)
+    let mut out = vec![preserve::marker(code, kind, &id)];
+    out.extend(visible);
+    out
+}
+
+fn visible_copy(original: &[String], visible_in: VisibleIn) -> Vec<String> {
+    let longest = original
+        .iter()
+        .map(|l| l.trim_start().chars().take_while(|c| *c == '`').count())
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat((longest + 1).max(3));
+    let mut out = match visible_in {
+        VisibleIn::Quarto => vec![format!("{fence}{{.markdown .{PRESERVED_CLASS}}}")],
+        VisibleIn::Myst => vec![
+            format!("{fence}{{code-block}} markdown"),
+            format!(":class: {PRESERVED_CLASS}"),
+            String::new(),
+        ],
+    };
+    out.extend(original.iter().cloned());
+    out.push(fence);
+    out
 }
 
 /// Extracts a short human-readable label for a preserved construct from a
@@ -278,5 +318,306 @@ mod include_path_tests {
                 "{input}"
             );
         }
+    }
+}
+
+/// Code-block options in MyST spelling, in a fixed order: `linenos`,
+/// `emphasize-lines`, `caption`, then anything else. Accepts either
+/// dialect's names (Quarto's `code-line-numbers` / `filename`).
+#[must_use]
+pub fn myst_code_options(attrs: &BTreeMap<String, String>) -> Vec<String> {
+    let mut out = Vec::new();
+    let numbers = attrs.get("code-line-numbers").map(String::as_str);
+    if attrs.contains_key("linenos") || matches!(numbers, Some(n) if n != "false") {
+        out.push(":linenos:".to_string());
+    }
+    let emphasis = attrs.get("emphasize-lines").cloned().or_else(|| {
+        numbers
+            .filter(|n| !matches!(*n, "true" | "false"))
+            .map(str::to_string)
+    });
+    if let Some(lines) = emphasis {
+        out.push(format!(":emphasize-lines: {lines}"));
+    }
+    if let Some(caption) = attrs.get("caption").or_else(|| attrs.get("filename")) {
+        out.push(format!(":caption: {caption}"));
+    }
+    for (k, v) in attrs {
+        if matches!(
+            k.as_str(),
+            "linenos" | "emphasize-lines" | "caption" | "code-line-numbers" | "filename"
+        ) {
+            continue;
+        }
+        out.push(if v.is_empty() {
+            format!(":{k}:")
+        } else {
+            format!(":{k}: {v}")
+        });
+    }
+    out
+}
+
+/// Code-block attributes in Quarto spelling: `code-line-numbers` (`true`,
+/// or the emphasized lines), `filename`, then anything else.
+#[must_use]
+pub fn quarto_code_attrs(attrs: &BTreeMap<String, String>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let numbers = attrs
+        .get("emphasize-lines")
+        .cloned()
+        .or_else(|| attrs.get("code-line-numbers").cloned())
+        .or_else(|| attrs.contains_key("linenos").then(|| "true".to_string()));
+    if let Some(n) = numbers {
+        out.push(("code-line-numbers".to_string(), n));
+    }
+    if let Some(name) = attrs.get("filename").or_else(|| attrs.get("caption")) {
+        out.push(("filename".to_string(), name.clone()));
+    }
+    for (k, v) in attrs {
+        if matches!(
+            k.as_str(),
+            "linenos" | "emphasize-lines" | "caption" | "code-line-numbers" | "filename"
+        ) {
+            continue;
+        }
+        out.push((k.clone(), v.clone()));
+    }
+    out
+}
+
+/// A table as rows of cells, each cell a list of lines. The shared model
+/// behind MyST `{list-table}`, Pandoc pipe tables and Pandoc grid tables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CellTable {
+    pub header_rows: usize,
+    pub rows: Vec<Vec<Vec<String>>>,
+}
+
+impl CellTable {
+    /// Parses a MyST `{list-table}` body: `* - cell` starts a row, `  - cell`
+    /// a further cell, and deeper-indented lines continue the current cell.
+    #[must_use]
+    pub fn from_list_table(body: &[String], header_rows: usize) -> Self {
+        let mut rows: Vec<Vec<Vec<String>>> = Vec::new();
+        for line in body {
+            let trimmed = line.trim_start();
+            let indent = line.len() - trimmed.len();
+            if let Some(cell) = trimmed
+                .strip_prefix("* - ")
+                .or_else(|| (trimmed == "* -").then_some(""))
+            {
+                rows.push(vec![vec![cell.to_string()]]);
+            } else if let Some(cell) = trimmed
+                .strip_prefix("- ")
+                .or_else(|| (trimmed == "-").then_some(""))
+            {
+                if indent > 0 {
+                    if let Some(row) = rows.last_mut() {
+                        row.push(vec![cell.to_string()]);
+                        continue;
+                    }
+                }
+            } else if let Some(cell) = rows.last_mut().and_then(|r| r.last_mut()) {
+                if !trimmed.is_empty() || !cell.last().is_some_and(String::is_empty) {
+                    cell.push(trimmed.to_string());
+                }
+            }
+        }
+        for row in &mut rows {
+            for cell in row.iter_mut() {
+                while cell.last().is_some_and(|l| l.is_empty()) {
+                    cell.pop();
+                }
+            }
+        }
+        Self { header_rows, rows }
+    }
+
+    /// Parses Pandoc grid table lines (`+---+` borders, `|` cell lines, a
+    /// `+===+` border after the header). Spans are not supported.
+    #[must_use]
+    pub fn from_grid(lines: &[String]) -> Option<Self> {
+        let border = lines.first()?.trim();
+        if !border.starts_with('+') {
+            return None;
+        }
+        let cuts: Vec<usize> = border
+            .char_indices()
+            .filter(|(_, c)| *c == '+')
+            .map(|(i, _)| i)
+            .collect();
+        if cuts.len() < 2 {
+            return None;
+        }
+        let mut rows = Vec::new();
+        let mut header_rows = 0;
+        let mut current: Vec<Vec<String>> = vec![Vec::new(); cuts.len() - 1];
+        for line in &lines[1..] {
+            let line = line.trim();
+            if line.starts_with('+') {
+                rows.push(std::mem::replace(
+                    &mut current,
+                    vec![Vec::new(); cuts.len() - 1],
+                ));
+                if line.contains('=') {
+                    header_rows = rows.len();
+                }
+            } else if line.starts_with('|') {
+                for (c, cell) in current.iter_mut().enumerate() {
+                    let text = line.get(cuts[c] + 1..cuts[c + 1]).unwrap_or("").trim();
+                    cell.push(text.to_string());
+                }
+            }
+        }
+        for row in &mut rows {
+            for cell in row.iter_mut() {
+                while cell.last().is_some_and(String::is_empty) {
+                    cell.pop();
+                }
+                while cell.first().is_some_and(String::is_empty) {
+                    cell.remove(0);
+                }
+            }
+        }
+        Some(Self { header_rows, rows })
+    }
+
+    fn columns(&self) -> usize {
+        self.rows.iter().map(Vec::len).max().unwrap_or(0)
+    }
+
+    /// Pipe-table lines when every cell is a single line and there is one
+    /// header row; grid-table lines otherwise.
+    #[must_use]
+    pub fn to_markdown(&self) -> Vec<String> {
+        let single_line = self.rows.iter().flatten().all(|c| c.len() <= 1);
+        if single_line && self.header_rows == 1 {
+            self.to_pipe()
+        } else {
+            self.to_grid()
+        }
+    }
+
+    fn cell_text(cell: &[String]) -> String {
+        cell.first().cloned().unwrap_or_default()
+    }
+
+    fn to_pipe(&self) -> Vec<String> {
+        let cols = self.columns();
+        let row_line = |row: &Vec<Vec<String>>| {
+            let cells: Vec<String> = (0..cols)
+                .map(|c| {
+                    row.get(c)
+                        .map(|cell| Self::cell_text(cell))
+                        .unwrap_or_default()
+                })
+                .collect();
+            format!("| {} |", cells.join(" | "))
+        };
+        let mut out = vec![row_line(&self.rows[0])];
+        out.push(format!("|{}|", vec!["---"; cols].join("|")));
+        out.extend(self.rows[1..].iter().map(row_line));
+        out
+    }
+
+    fn to_grid(&self) -> Vec<String> {
+        let cols = self.columns();
+        let widths: Vec<usize> = (0..cols)
+            .map(|c| {
+                self.rows
+                    .iter()
+                    .filter_map(|r| r.get(c))
+                    .flatten()
+                    .map(|l| l.chars().count())
+                    .max()
+                    .unwrap_or(0)
+                    .max(3)
+            })
+            .collect();
+        let border = |ch: char| {
+            let parts: Vec<String> = widths
+                .iter()
+                .map(|w| ch.to_string().repeat(w + 2))
+                .collect();
+            format!("+{}+", parts.join("+"))
+        };
+        let mut out = vec![border('-')];
+        for (r, row) in self.rows.iter().enumerate() {
+            let height = row.iter().map(Vec::len).max().unwrap_or(1).max(1);
+            for line in 0..height {
+                let parts: Vec<String> = (0..cols)
+                    .map(|c| {
+                        let text = row
+                            .get(c)
+                            .and_then(|cell| cell.get(line))
+                            .cloned()
+                            .unwrap_or_default();
+                        let pad = widths[c] - text.chars().count();
+                        format!(" {text}{} ", " ".repeat(pad))
+                    })
+                    .collect();
+                out.push(format!("|{}|", parts.join("|")));
+            }
+            out.push(border(if r + 1 == self.header_rows { '=' } else { '-' }));
+        }
+        out
+    }
+
+    /// `{list-table}` body lines.
+    #[must_use]
+    pub fn to_list_table(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for row in &self.rows {
+            for (c, cell) in row.iter().enumerate() {
+                let marker = if c == 0 { "* - " } else { "  - " };
+                let mut lines = cell.iter();
+                out.push(format!(
+                    "{marker}{}",
+                    lines.next().cloned().unwrap_or_default()
+                ));
+                for more in lines {
+                    out.push(if more.is_empty() {
+                        String::new()
+                    } else {
+                        format!("    {more}")
+                    });
+                }
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod table_tests {
+    use super::CellTable;
+
+    fn lines(s: &str) -> Vec<String> {
+        s.lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn a_single_line_list_table_becomes_a_pipe_table() {
+        let t = CellTable::from_list_table(&lines("* - A\n  - B\n* - 1\n  - 2\n"), 1);
+        assert_eq!(t.to_markdown(), lines("| A | B |\n|---|---|\n| 1 | 2 |"));
+    }
+
+    #[test]
+    fn multi_line_cells_become_a_grid_table_that_parses_back() {
+        let t = CellTable::from_list_table(
+            &lines("* - Name\n  - Notes\n* - x\n  - first\n\n    second\n"),
+            1,
+        );
+        let grid = t.to_markdown();
+        assert!(grid[0].starts_with('+'), "{grid:?}");
+        assert!(grid.iter().any(|l| l.contains('=')));
+        let back = CellTable::from_grid(&grid).unwrap();
+        assert_eq!(back.header_rows, 1);
+        assert_eq!(back.rows[1][1], vec!["first", "", "second"]);
+        assert_eq!(
+            back.to_list_table(),
+            lines("* - Name\n  - Notes\n* - x\n  - first\n\n    second")
+        );
     }
 }

@@ -1,0 +1,4 @@
+<!-- mystquarto-roundtrip: stable -->
+::: {.callout-tip title="Custom title"}
+A tip.
+:::

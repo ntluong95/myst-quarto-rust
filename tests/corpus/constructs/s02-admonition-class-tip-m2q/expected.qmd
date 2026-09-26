@@ -1,0 +1,3 @@
+::: {.callout-tip title="Custom title"}
+Tip-classed admonition.
+:::
