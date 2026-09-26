@@ -175,13 +175,13 @@ pub fn execute(args: &ConvertArgs, direction: Direction) -> Result<RunReport> {
         .with_context(|| format!("could not resolve input path {}", args.input.display()))?;
     let is_dir = input_meta.is_dir();
 
+    // The project the input belongs to: the directory itself, or for a
+    // single file the nearest ancestor holding the source config (else a
+    // git root, else the file's own directory).
     let input_dir = if is_dir {
         canonical_input.clone()
     } else {
-        canonical_input
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."))
+        enclosing_root(&canonical_input, direction)
     };
 
     let output_hint = if args.in_place {
@@ -193,7 +193,13 @@ pub fn execute(args: &ConvertArgs, direction: Direction) -> Result<RunReport> {
                 input_dir.display()
             );
         }
-        canonical_input.clone()
+        if is_dir {
+            canonical_input.clone()
+        } else {
+            canonical_input
+                .parent()
+                .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+        }
     } else if let Some(explicit) = &args.output {
         explicit.clone()
     } else {
@@ -223,23 +229,31 @@ pub fn execute(args: &ConvertArgs, direction: Direction) -> Result<RunReport> {
         check_in_place_preconditions(&canonical_input, args.force)?;
     }
 
-    let mut report = if is_dir {
-        execute_directory(
+    let selection = if is_dir {
+        select_project(args, direction, &canonical_input, &effective_output_root)
+    } else {
+        select_file(
             args,
             direction,
             &canonical_input,
+            &input_dir,
             &effective_output_root,
-            previous_output,
-        )?
-    } else {
-        execute_single_file(args, direction, &canonical_input, &effective_output_root)?
+        )
     };
+    let suppress_path = selection.root.join(SIDECAR_DIR).join(SUPPRESS_FILE);
+    let mut report = execute_selection(
+        args,
+        direction,
+        selection,
+        &effective_output_root,
+        previous_output,
+    )?;
 
     if !args.dry_run && !args.in_place {
         write_output_marker(&effective_output_root, direction)?;
     }
 
-    let suppressed = load_suppressed_codes(&canonical_input.join(SIDECAR_DIR).join(SUPPRESS_FILE));
+    let suppressed = load_suppressed_codes(&suppress_path);
     if !suppressed.is_empty() {
         report.warnings.retain(|d| !suppressed.contains(d.code));
     }
@@ -357,38 +371,249 @@ fn load_suppressed_codes(path: &Path) -> std::collections::BTreeSet<String> {
     out
 }
 
-fn execute_directory(
-    args: &ConvertArgs,
-    direction: Direction,
-    canonical_input: &Path,
-    effective_output_root: &Path,
-    previous_output: bool,
-) -> Result<RunReport> {
-    let source_config_name = direction.source_config_name();
-    let root_config = canonical_input.join(source_config_name);
-    let config_files: Vec<PathBuf> = if root_config.is_file() {
-        vec![root_config.clone()]
-    } else {
-        Vec::new()
-    };
-    let dialect = match direction {
+/// What one run converts: a root every path is under (output mirrors
+/// it), the files, and where the target config comes from.
+struct Selection {
+    root: PathBuf,
+    file_set: closure::FileSet,
+    config: ConfigChoice,
+}
+
+enum ConfigChoice {
+    /// No config to write (bare folder, or `--in-place` on a single file).
+    None,
+    /// Convert this source config.
+    Convert(PathBuf),
+    /// Write a minimal config naming this single file.
+    Synthesize(PathBuf),
+}
+
+fn config_dialect(direction: Direction) -> closure::ConfigDialect {
+    match direction {
         Direction::MystToQuarto => closure::ConfigDialect::Myst,
         Direction::QuartoToMyst => closure::ConfigDialect::Quarto,
+    }
+}
+
+/// The nearest ancestor of `file` holding the source config, else the
+/// nearest holding a git directory, else the file's own directory.
+fn enclosing_root(file: &Path, direction: Direction) -> PathBuf {
+    let parent = file
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let find = |marker: &str| {
+        parent
+            .ancestors()
+            .find(|d| d.join(marker).exists())
+            .map(Path::to_path_buf)
     };
-    let start = match (args.scope, config_files.is_empty()) {
+    find(direction.source_config_name())
+        .or_else(|| find(".git"))
+        .unwrap_or(parent)
+}
+
+/// A project directory: its config closure, or a filtered walk.
+fn select_project(
+    args: &ConvertArgs,
+    direction: Direction,
+    root: &Path,
+    output_root: &Path,
+) -> Selection {
+    let config = root.join(direction.source_config_name());
+    let has_config = config.is_file();
+    let start = match (args.scope, has_config) {
         (Scope::All, _) => closure::Start::Walk { all: true },
-        (Scope::Manuscript, true) => closure::Start::Walk { all: false },
-        (Scope::Manuscript, false) => closure::Start::Config {
-            path: &root_config,
-            dialect,
+        (Scope::Manuscript, false) => closure::Start::Walk { all: false },
+        (Scope::Manuscript, true) => closure::Start::Config {
+            path: &config,
+            dialect: config_dialect(direction),
         },
     };
     let file_set = closure::resolve(&closure::Request {
-        root: canonical_input,
-        output_root: Some(effective_output_root),
+        root,
+        output_root: Some(output_root),
         source_ext: direction.source_extension(),
         start,
     });
+    Selection {
+        root: root.to_path_buf(),
+        file_set,
+        config: if has_config {
+            ConfigChoice::Convert(config)
+        } else {
+            ConfigChoice::None
+        },
+    }
+}
+
+/// A single file is a one-article project rooted at that file. When the
+/// enclosing project's config already names it, that is the same as
+/// converting the project, so the project's closure and config are used.
+/// Otherwise the closure starts from the file (includes, figures,
+/// bibliography, embeds), output mirrors the closure's common ancestor so
+/// `../` references keep resolving, and a minimal config is written.
+fn select_file(
+    args: &ConvertArgs,
+    direction: Direction,
+    file: &Path,
+    project_root: &Path,
+    output_root: &Path,
+) -> Selection {
+    let config = project_root.join(direction.source_config_name());
+    let mut hint = None;
+    if config.is_file() {
+        hint = Some(
+            Diagnostic::new(
+                Severity::Info,
+                codes::config::SINGLE_FILE_IN_PROJECT,
+                format!(
+                    "this file belongs to the project at {}; converting the project root is \
+                     usually what you want",
+                    project_root.display()
+                ),
+            )
+            .with_file(file.to_path_buf()),
+        );
+        let mut project = select_project(args, direction, project_root, output_root);
+        if !args.in_place && project.file_set.content.iter().any(|c| c == file) {
+            project.file_set.diagnostics.extend(hint);
+            return project;
+        }
+    }
+
+    let files = [file.to_path_buf()];
+    let mut file_set = closure::resolve(&closure::Request {
+        root: project_root,
+        output_root: Some(output_root),
+        source_ext: direction.source_extension(),
+        start: closure::Start::Files(&files),
+    });
+    file_set.diagnostics.extend(hint);
+    let root = if args.in_place {
+        file.parent()
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+    } else {
+        common_ancestor(
+            file_set
+                .content
+                .iter()
+                .chain(&file_set.notebooks)
+                .chain(&file_set.assets),
+        )
+        .unwrap_or_else(|| project_root.to_path_buf())
+    };
+    Selection {
+        root,
+        file_set,
+        config: if args.in_place {
+            ConfigChoice::None
+        } else {
+            ConfigChoice::Synthesize(file.to_path_buf())
+        },
+    }
+}
+
+/// The deepest directory containing every path.
+fn common_ancestor<'a>(paths: impl Iterator<Item = &'a PathBuf>) -> Option<PathBuf> {
+    let mut common: Option<PathBuf> = None;
+    for path in paths {
+        let dir = path.parent()?.to_path_buf();
+        common = Some(match common {
+            None => dir,
+            Some(c) => c
+                .ancestors()
+                .find(|a| dir.starts_with(a))
+                .map_or_else(PathBuf::new, Path::to_path_buf),
+        });
+    }
+    common
+}
+
+/// The minimal target config for a single-file run: MyST gets a one-entry
+/// toc (plus the page's bibliography, rebased to the root); Quarto gets a
+/// default project that renders the file.
+fn synthesized_config(direction: Direction, root: &Path, file: &Path) -> String {
+    use mystquarto_core::yaml::emit::{emit, EmitField, YamlDoc};
+    use mystquarto_core::YamlValue;
+    let slash = |p: &Path| p.to_string_lossy().replace('\\', "/");
+    let rel = slash(&swap_extension(
+        file.strip_prefix(root).unwrap_or(file),
+        direction,
+    ));
+    let doc = match direction {
+        Direction::QuartoToMyst => {
+            let mut project = vec![(
+                "toc".to_string(),
+                YamlValue::Sequence(vec![YamlValue::Mapping(vec![(
+                    "file".to_string(),
+                    YamlValue::String(rel),
+                )])]),
+            )];
+            let page_dir = file.parent().unwrap_or(root);
+            let bibs: Vec<YamlValue> = fs::read_to_string(file)
+                .map(|t| {
+                    mystquarto_core::config::bibliography::frontmatter_bibliography_entries(&t)
+                })
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|b| {
+                    let abs = page_dir.join(b);
+                    let abs = abs.canonicalize().unwrap_or(abs);
+                    abs.strip_prefix(root)
+                        .ok()
+                        .map(|r| YamlValue::String(slash(r)))
+                })
+                .collect();
+            if !bibs.is_empty() {
+                project.push(("bibliography".to_string(), YamlValue::Sequence(bibs)));
+            }
+            // Without a site template `myst build --html` writes nothing;
+            // the article theme also reads back as a one-article manuscript.
+            vec![
+                EmitField::new("version", YamlValue::Int(1)),
+                EmitField::new("project", YamlValue::Mapping(project)),
+                EmitField::new(
+                    "site",
+                    YamlValue::Mapping(vec![(
+                        "template".to_string(),
+                        YamlValue::String("article-theme".to_string()),
+                    )]),
+                ),
+            ]
+        }
+        Direction::MystToQuarto => vec![EmitField::new(
+            "project",
+            YamlValue::Mapping(vec![
+                ("type".to_string(), YamlValue::String("default".to_string())),
+                (
+                    "render".to_string(),
+                    YamlValue::Sequence(vec![YamlValue::String(rel)]),
+                ),
+            ]),
+        )],
+    };
+    emit(&YamlDoc(doc))
+}
+
+/// Carries out a [`Selection`]: converts content and config, copies
+/// assets, and writes the sidecars.
+fn execute_selection(
+    args: &ConvertArgs,
+    direction: Direction,
+    selection: Selection,
+    effective_output_root: &Path,
+    previous_output: bool,
+) -> Result<RunReport> {
+    let Selection {
+        root,
+        file_set,
+        config,
+    } = selection;
+    let canonical_input = root.as_path();
+    let config_files: Vec<PathBuf> = match &config {
+        ConfigChoice::Convert(path) => vec![path.clone()],
+        _ => Vec::new(),
+    };
     let content_files = file_set.content.clone();
 
     if !args.dry_run {
@@ -440,8 +665,11 @@ fn execute_directory(
     }
 
     if !args.no_config {
-        let ignored_config =
-            ignore_target_config_in_input(canonical_input, direction, args.dry_run, &mut warnings);
+        let ignored_config = if config_files.is_empty() {
+            None
+        } else {
+            ignore_target_config_in_input(canonical_input, direction, args.dry_run, &mut warnings)
+        };
         for config_path in &config_files {
             let out_config_path = effective_output_root.join(direction.target_config_name());
 
@@ -516,6 +744,27 @@ fn execute_directory(
                 }
             }
         }
+    }
+
+    if let (ConfigChoice::Synthesize(file), false, false) = (&config, args.no_config, args.dry_run)
+    {
+        let out_config_path = effective_output_root.join(direction.target_config_name());
+        write_atomic(
+            &out_config_path,
+            synthesized_config(direction, canonical_input, file).as_bytes(),
+        )
+        .with_context(|| format!("could not write {}", out_config_path.display()))?;
+        warnings.push(
+            Diagnostic::new(
+                Severity::Info,
+                codes::config::CONFIG_SYNTHESIZED,
+                format!(
+                    "wrote a minimal {} naming this file so the output builds on its own",
+                    direction.target_config_name()
+                ),
+            )
+            .with_file(file.clone()),
+        );
     }
 
     let mut assets_report = None;
@@ -1270,122 +1519,6 @@ fn relabel_and_write_sidecar(
     Ok(())
 }
 
-fn execute_single_file(
-    args: &ConvertArgs,
-    direction: Direction,
-    canonical_input_file: &Path,
-    effective_output_root: &Path,
-) -> Result<RunReport> {
-    let file_name = canonical_input_file
-        .file_name()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("output"));
-    let out_rel = swap_extension(&file_name, direction);
-    let out_path = path_guard::guard_target(effective_output_root, effective_output_root, &out_rel)
-        .with_context(|| format!("output path escapes {}", effective_output_root.display()))?;
-
-    if args.dry_run {
-        return Ok(RunReport {
-            effective_output_root: effective_output_root.to_path_buf(),
-            outcomes: vec![FileOutcome {
-                input: canonical_input_file.to_path_buf(),
-                output: out_path,
-                status: FileStatus::WouldConvert,
-            }],
-            assets: None,
-            config_conflict: None,
-            warnings: Vec::new(),
-        });
-    }
-
-    fs::create_dir_all(effective_output_root).with_context(|| {
-        format!(
-            "could not create output directory {}",
-            effective_output_root.display()
-        )
-    })?;
-
-    // A lone file has no project root of its own; its parent directory is
-    // the natural scope for include/notebook resolution, matching how a
-    // relative `{include}`/`#nb:` target in the file would already be
-    // resolved on disk.
-    let input_root = canonical_input_file
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let file_set = closure::resolve(&closure::Request {
-        root: &input_root,
-        output_root: Some(effective_output_root),
-        source_ext: direction.source_extension(),
-        start: closure::Start::Files(std::slice::from_ref(&canonical_input_file.to_path_buf())),
-    });
-    let batch = run_content_batch(
-        std::slice::from_ref(&canonical_input_file.to_path_buf()),
-        &file_set.notebooks,
-        &input_root,
-        direction,
-    );
-    let mut warnings: Vec<Diagnostic> = batch.warnings_ref().to_vec();
-    refuse_if_in_place_would_lose_preserved_content(
-        args,
-        &input_root,
-        effective_output_root,
-        batch.preserved_entries_ref(),
-    )?;
-
-    let status = match batch.rendered().get(canonical_input_file) {
-        Some(text) => {
-            write_atomic(&out_path, text.as_bytes())
-                .with_context(|| format!("could not write {}", out_path.display()))?;
-            if args.in_place && canonical_input_file != out_path && canonical_input_file.exists() {
-                fs::remove_file(canonical_input_file).with_context(|| {
-                    format!("could not remove source {}", canonical_input_file.display())
-                })?;
-            }
-            if let ContentBatch::MystToQuarto {
-                notebook_renames,
-                sidecar,
-                ..
-            } = &batch
-            {
-                relabel_and_write_sidecar(
-                    args,
-                    &input_root,
-                    effective_output_root,
-                    notebook_renames,
-                    sidecar,
-                    &mut warnings,
-                )?;
-            }
-            write_preserved_content_sidecar(
-                batch.preserved_entries_ref(),
-                args,
-                &input_root,
-                effective_output_root,
-                &mut warnings,
-            )?;
-            FileStatus::Converted
-        }
-        None => {
-            let message = batch_error_message(batch.errors_ref(), canonical_input_file)
-                .unwrap_or_else(|| "conversion failed for an unknown reason".to_string());
-            FileStatus::Failed(message)
-        }
-    };
-
-    Ok(RunReport {
-        effective_output_root: effective_output_root.to_path_buf(),
-        outcomes: vec![FileOutcome {
-            input: canonical_input_file.to_path_buf(),
-            output: out_path,
-            status,
-        }],
-        assets: None,
-        config_conflict: None,
-        warnings,
-    })
-}
-
 /// Computes the output path for one content file inside a directory
 /// conversion, and passes it through [`path_guard::guard_target`] as
 /// defense-in-depth (the relative path is derived from a file discovery
@@ -1742,6 +1875,64 @@ mod tests {
             .iter()
             .any(|d| d.code == codes::io::DENIED_REFERENCE && d.severity == Severity::Error));
         assert!(!tmp.join("out").join(&raw_tier).exists());
+
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn a_single_file_the_project_names_converts_the_project_closure() {
+        let tmp = tempdir("single-in-project");
+        let input = input_dir(&tmp);
+        fs::write(
+            input.join("_quarto.yml"),
+            "project:\n  type: manuscript\nmanuscript:\n  article: index.qmd\n",
+        )
+        .unwrap();
+        fs::write(input.join("index.qmd"), "# Hi\n\n![F](img/f.png)\n").unwrap();
+        fs::create_dir_all(input.join("img")).unwrap();
+        fs::write(input.join("img/f.png"), "png").unwrap();
+        fs::write(input.join("notes.qmd"), "# Not part of it\n").unwrap();
+
+        let mut args = base_args(input.join("index.qmd"));
+        args.output = Some(tmp.join("out"));
+        let report = execute(&args, Direction::QuartoToMyst).unwrap();
+        assert!(!report.has_failures(), "{:?}", report.outcomes);
+        assert!(tmp.join("out/index.md").exists());
+        assert!(tmp.join("out/img/f.png").exists());
+        assert!(tmp.join("out/myst.yml").exists());
+        assert!(!tmp.join("out/notes.md").exists());
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.code == codes::config::SINGLE_FILE_IN_PROJECT));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.code == codes::config::CONFIG_RESTORED_FROM_SNAPSHOT
+                || w.code == codes::config::MANUSCRIPT_ARTICLE_RESTORED));
+
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn a_single_file_outside_any_config_gets_a_synthesized_config() {
+        let tmp = tempdir("single-synth");
+        let input = input_dir(&tmp);
+        fs::create_dir_all(input.join("doc")).unwrap();
+        fs::write(input.join("doc/page.md"), "# Page\n").unwrap();
+
+        let mut args = base_args(input.join("doc/page.md"));
+        args.output = Some(tmp.join("out"));
+        let report = execute(&args, Direction::MystToQuarto).unwrap();
+        assert!(!report.has_failures(), "{:?}", report.outcomes);
+        assert_eq!(
+            fs::read_to_string(tmp.join("out/_quarto.yml")).unwrap(),
+            "project:\n  type: default\n  render:\n    - page.qmd\n"
+        );
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.code == codes::config::CONFIG_SYNTHESIZED));
 
         cleanup(&tmp);
     }

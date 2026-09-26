@@ -387,6 +387,11 @@ fn render(dialect: Dialect, dir: &Path, scratch: &Path, label: &str) -> Vec<Stri
             tail(&log, 15)
         ));
     }
+    // `myst build --html` exits 0 without writing a page when the config
+    // has no site; that is a failed build too.
+    if dialect == Dialect::Myst && ok && html_text(&copy.join("_build/html")).is_empty() {
+        problems.push("myst build --html produced no HTML".into());
+    }
     problems
         .into_iter()
         .map(|p| format!("[{label}] {p}"))
@@ -645,4 +650,82 @@ fn e2e_myst_native_converts_renders_and_round_trips_cleanly() {
         source: Dialect::Myst,
         content: &["index.md", "chapter.md"],
     });
+}
+
+/// Every `.html` file under `dir`, concatenated.
+fn html_text(dir: &Path) -> String {
+    if !dir.exists() {
+        return String::new();
+    }
+    tree_snapshot(dir)
+        .into_iter()
+        .filter(|(p, _)| p.extension().is_some_and(|e| e == "html"))
+        .map(|(_, bytes)| String::from_utf8_lossy(&bytes).into_owned())
+        .collect()
+}
+
+/// A single manuscript file in a repo without a project config, whose
+/// include, figure and bibliography sit in sibling folders reached with
+/// `../`. Converting just that file must produce a project that builds.
+#[test]
+fn single_file_mode_builds_on_its_own_in_both_directions() {
+    let tmp = tempdir("single-file");
+    let src = tmp.join("src");
+    let ask = workspace_root().join("tests/e2e/ask-manuscript");
+    fs::create_dir_all(src.join("manuscript/sections")).unwrap();
+    copy_dir(&ask.join("images"), &src.join("images"));
+    copy_dir(&ask.join("literature"), &src.join("literature"));
+    fs::write(
+        src.join("manuscript/sections/_intro.qmd"),
+        "# Introduction {#sec-intro}\n\nBackground text citing [see @smith2020, p. 3].\n",
+    )
+    .unwrap();
+    fs::write(
+        src.join("manuscript/index.qmd"),
+        "---\ntitle: Single file\nbibliography: ../literature/references.bib\n---\n\n\
+         {{< include sections/_intro.qmd >}}\n\n# Methods\n\nSee @fig-main and @sec-intro.\n\n\
+         ![Main result figure](../images/fig1.png){#fig-main}\n",
+    )
+    .unwrap();
+    git_init_commit(&src);
+    let mut problems = Vec::new();
+
+    let myst = tmp.join("myst");
+    let mut to_myst = Command::new(env!("CARGO_BIN_EXE_quarto2myst"));
+    to_myst
+        .arg(src.join("manuscript/index.qmd"))
+        .arg("-o")
+        .arg(&myst);
+    let (ok, log) = run_bounded(to_myst);
+    assert!(ok, "quarto2myst single file failed:\n{log}");
+    assert!(myst.join("images/fig1.png").exists(), "figure not copied");
+    assert!(myst.join("myst.yml").exists(), "no config synthesized");
+    problems.extend(render(Dialect::Myst, &myst, &tmp, "single myst"));
+    let html = html_text(&tmp.join("render-single-myst/_build/html"));
+    if !html.contains("Background text") {
+        problems.push("[single myst] the included Introduction is missing".into());
+    }
+    if !html.contains("fig1") {
+        problems.push("[single myst] the figure image is missing".into());
+    }
+
+    let quarto = tmp.join("quarto");
+    let mut to_quarto = Command::new(env!("CARGO_BIN_EXE_myst2quarto"));
+    to_quarto
+        .arg(myst.join("manuscript/index.md"))
+        .arg("-o")
+        .arg(&quarto);
+    let (ok, log) = run_bounded(to_quarto);
+    assert!(ok, "myst2quarto single file failed:\n{log}");
+    problems.extend(render(Dialect::Quarto, &quarto, &tmp, "single quarto"));
+
+    if problems.is_empty() {
+        cleanup(&tmp);
+    } else {
+        panic!(
+            "single-file problems (scratch kept at {}):\n{}",
+            tmp.display(),
+            problems.join("\n")
+        );
+    }
 }

@@ -155,6 +155,13 @@ pub mod config {
     /// conversion recorded, verbatim or with the user's edits merged in.
     /// Severity: Info.
     pub const CONFIG_RESTORED_FROM_SNAPSHOT: &str = "MQ0416";
+    /// A single file was converted from inside a project that has its own
+    /// config; converting the project root is usually what the user
+    /// wants. Severity: Info.
+    pub const SINGLE_FILE_IN_PROJECT: &str = "MQ0417";
+    /// A single-file run wrote a minimal target config naming the file,
+    /// so the output builds on its own. Severity: Info.
+    pub const CONFIG_SYNTHESIZED: &str = "MQ0418";
 }
 
 /// MQ06xx — file, IO, path safety, discovery.

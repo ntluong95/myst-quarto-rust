@@ -89,6 +89,8 @@ the rest of `mappings.toml` is tracked, not done, in
 | MQ0414 | Info | A Quarto manuscript's `manuscript.article`/`manuscript.notebooks` were mapped back to myst.yml's `project.toc` (and `project.exports[].article`). | No action — without this the converted MyST project has no toc at all, so MyST falls back to whatever page it discovers first (e.g. `README.md`) as the landing page. |
 | MQ0415 | Info | The input also contained the *target* dialect's config (for example a stale `myst.yml` next to `_quarto.yml`). It was ignored, the source config was converted instead, and the ignored file's text was kept in `.mystquarto/preserved.json`. | None. Delete the stale file from the source project if it is no longer hand-maintained. |
 | MQ0416 | Info | The target config was restored from the snapshot a previous conversion recorded in `.mystquarto/preserved.json`: exactly, when the config was unchanged, or with your edits merged into the original. | None. Delete `.mystquarto/preserved.json` to convert the config from scratch instead. |
+| MQ0417 | Info | A single file was converted from inside a project that has its own config. When that config names the file, the whole project closure is converted. | Usually convert the project root instead. |
+| MQ0418 | Info | A single-file run wrote a minimal target config (`myst.yml` with a one-entry toc, or a default `_quarto.yml` that renders the file) so the output builds on its own. | None. |
 
 ## MQ06xx — file, IO, path safety, discovery
 
