@@ -198,7 +198,7 @@ mod tests {
         assert_eq!(m.role.len(), 11);
         assert_eq!(m.inline.len(), 5);
         assert_eq!(m.config_field.len(), 32);
-        assert_eq!(m.export_format.len(), 6);
+        assert_eq!(m.export_format.len(), 7);
         assert_eq!(m.legacy_role.len(), 9);
         assert_eq!(m.label_prefix.len(), 22);
     }

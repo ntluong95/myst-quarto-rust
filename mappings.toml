@@ -659,6 +659,13 @@ fidelity = "exact"
 ref = "§8.3"
 
 [[export_format]]
+myst = "- format: typst"
+quarto = "format: {typst: {}}"
+fidelity = "exact"
+note = "output -> output-file; a template file path carries over"
+ref = "§8.3"
+
+[[export_format]]
 myst = "- format: meca"
 fidelity = "unmappable"
 ref = "§8.3"

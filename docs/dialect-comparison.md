@@ -416,6 +416,7 @@ MyST `exports` is a list of `{format\|template, …}`; Quarto `format` is a map.
 | - format: docx | format: {docx: {}} | ✅ |  |
 | - format: tex | format: {latex: {}} | ✅ |  |
 | - format: jats | format: {jats: {}} | ✅ |  |
+| - format: typst | format: {typst: {}} | ✅ | output -> output-file; a template file path carries over |
 | - format: meca | — | ❌ |  |
 | - template: lapreprint-typst | format: {typst: {}} | ⚠️ | template not portable |
 <!-- end generated (export_format) -->

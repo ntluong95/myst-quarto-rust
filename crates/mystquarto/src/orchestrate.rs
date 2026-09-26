@@ -1111,12 +1111,14 @@ fn guarded_output_path(
     )
 }
 
+/// The same rename the writers apply to include targets, so an include
+/// always names the file written here.
 fn swap_extension(rel: &Path, direction: Direction) -> PathBuf {
-    let from_ext = direction.source_extension();
-    match rel.extension().and_then(|e| e.to_str()) {
-        Some(ext) if ext == from_ext => rel.with_extension(direction.target_extension()),
-        _ => rel.to_path_buf(),
-    }
+    mystquarto_core::writer::swap_content_extension(
+        rel,
+        direction.source_extension(),
+        direction.target_extension(),
+    )
 }
 
 fn alongside_new_path(path: &Path) -> PathBuf {

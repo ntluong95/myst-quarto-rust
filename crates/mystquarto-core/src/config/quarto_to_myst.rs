@@ -430,7 +430,7 @@ pub(crate) fn format_to_exports(
 ) -> (Option<YamlValue>, Vec<Diagnostic>) {
     let mut exports = Vec::new();
     let mut warnings = Vec::new();
-    for (key, _) in format {
+    for (key, options) in format {
         let myst_format = match key.as_str() {
             // `html` is never a real `exports[].format` value in myst.yml —
             // MyST's own schema rejects it outright (valid set: `pdf`,
@@ -446,6 +446,7 @@ pub(crate) fn format_to_exports(
             "docx" => "docx",
             "latex" => "tex",
             "jats" => "jats",
+            "typst" => "typst",
             other => {
                 warnings.push(warn(
                     Severity::Warning,
@@ -458,10 +459,23 @@ pub(crate) fn format_to_exports(
                 other
             }
         };
-        exports.push(YamlValue::Mapping(vec![(
+        let mut export = vec![(
             "format".to_string(),
             YamlValue::String(myst_format.to_string()),
-        )]));
+        )];
+        let options = as_mapping(options).unwrap_or(&[]);
+        if let Some(template) = get(options, "template").and_then(as_str) {
+            if crate::config::exports::is_template_path(template) {
+                export.push((
+                    "template".to_string(),
+                    YamlValue::String(template.to_string()),
+                ));
+            }
+        }
+        if let Some(output) = get(options, "output-file").and_then(as_str) {
+            export.push(("output".to_string(), YamlValue::String(output.to_string())));
+        }
+        exports.push(YamlValue::Mapping(export));
     }
     if exports.is_empty() {
         (None, warnings)
@@ -473,6 +487,17 @@ pub(crate) fn format_to_exports(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quarto_content_extension_rewrite_never_doubles_an_extension() {
+        for (input, want) in [
+            ("index.qmd", "index.md"),
+            ("index.md", "index.md"),
+            ("analysis.ipynb", "analysis.ipynb"),
+        ] {
+            assert_eq!(rewrite_quarto_content_extension(input), want, "{input}");
+        }
+    }
 
     #[test]
     fn book_type_project_maps_book_title_authors_and_chapters_back() {
@@ -520,10 +545,25 @@ mod tests {
 
     #[test]
     fn unrecognized_format_key_passes_through_with_a_warning() {
-        let quarto = "title: X\nformat:\n  typst: {}\n";
+        let quarto = "title: X\nformat:\n  revealjs: {}\n";
         let result = convert(quarto, None).unwrap();
-        assert!(result.text.contains("format: typst"));
+        assert!(result.text.contains("format: revealjs"));
         assert_eq!(result.warnings.len(), 1);
+    }
+
+    #[test]
+    fn typst_maps_back_to_a_typst_export_with_output_and_template() {
+        let quarto =
+            "title: X\nformat:\n  typst:\n    template: t/paper.typ\n    output-file: paper.pdf\n";
+        let result = convert(quarto, None).unwrap();
+        assert!(result.text.contains("format: typst"), "{}", result.text);
+        assert!(
+            result.text.contains("template: t/paper.typ"),
+            "{}",
+            result.text
+        );
+        assert!(result.text.contains("output: paper.pdf"), "{}", result.text);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
     }
 
     #[test]

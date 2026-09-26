@@ -244,3 +244,39 @@ pub(crate) fn resolve_myst_label(source: &Path, label: &Label, restore: &Restore
         .cloned()
         .unwrap_or_else(|| label.clone())
 }
+
+/// Swaps `from` to `to` on a content-file path and leaves every other
+/// extension (and the whole directory/stem) untouched. Include directives
+/// and the file writer both use this rule, so an include always names the
+/// file that was actually written.
+#[must_use]
+pub fn swap_content_extension(path: &Path, from: &str, to: &str) -> PathBuf {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) if ext == from => path.with_extension(to),
+        _ => path.to_path_buf(),
+    }
+}
+
+#[cfg(test)]
+mod include_path_tests {
+    use super::swap_content_extension;
+    use std::path::Path;
+
+    #[test]
+    fn include_targets_keep_the_underscore_and_swap_only_content_extensions() {
+        let cases = [
+            ("sections/_intro.qmd", "qmd", "md", "sections/_intro.md"),
+            ("_intro.md", "md", "qmd", "_intro.qmd"),
+            ("intro.md", "md", "qmd", "intro.qmd"),
+            ("snippet.py", "md", "qmd", "snippet.py"),
+            ("data/table.csv", "qmd", "md", "data/table.csv"),
+        ];
+        for (input, from, to, want) in cases {
+            assert_eq!(
+                swap_content_extension(Path::new(input), from, to),
+                Path::new(want),
+                "{input}"
+            );
+        }
+    }
+}

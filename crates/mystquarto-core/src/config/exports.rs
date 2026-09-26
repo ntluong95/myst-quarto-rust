@@ -41,9 +41,10 @@ pub fn exports_to_format(exports: &[YamlValue]) -> (Option<FormatField>, Vec<Dia
         };
         if let Some(fmt) = get(m, "format").and_then(as_str) {
             match known_format(fmt) {
-                Some(quarto_key) => {
-                    entries.push((quarto_key.to_string(), default_format_options(quarto_key)))
-                }
+                Some(quarto_key) => entries.push((
+                    quarto_key.to_string(),
+                    with_export_options(default_format_options(quarto_key), m),
+                )),
                 None if fmt == "meca" => warnings.push(warn(
                     Severity::Warning,
                     codes::EXPORT_FORMAT_DROPPED,
@@ -142,12 +143,46 @@ fn default_format_options(quarto_key: &str) -> YamlValue {
     }
 }
 
+/// Carries the per-export options that have a direct Quarto format option:
+/// `output` -> `output-file`, and `template` -> `template` when it is a file
+/// path (a MyST template *name* such as `lapreprint-typst` is not portable).
+fn with_export_options(defaults: YamlValue, export: &[(String, YamlValue)]) -> YamlValue {
+    let YamlValue::Mapping(mut options) = defaults else {
+        return defaults;
+    };
+    if let Some(output) = get(export, "output").and_then(as_str) {
+        options.push((
+            "output-file".to_string(),
+            YamlValue::String(output.to_string()),
+        ));
+    }
+    if let Some(template) = get(export, "template").and_then(as_str) {
+        if is_template_path(template) {
+            options.push((
+                "template".to_string(),
+                YamlValue::String(template.to_string()),
+            ));
+        }
+    }
+    YamlValue::Mapping(options)
+}
+
+/// A template value that names a local file rather than a MyST template
+/// registry entry.
+pub(crate) fn is_template_path(template: &str) -> bool {
+    template.contains('/')
+        || [".typ", ".tex", ".docx"]
+            .iter()
+            .any(|ext| template.ends_with(ext))
+}
+
 fn known_format(fmt: &str) -> Option<&'static str> {
     match fmt {
         "pdf" => Some("pdf"),
         "docx" => Some("docx"),
         "tex" => Some("latex"),
         "jats" => Some("jats"),
+        "typst" => Some("typst"),
         _ => None,
     }
 }
@@ -204,6 +239,43 @@ mod tests {
         };
         assert_eq!(m[0].0, "html");
         assert_eq!(m[1], ("pdf".to_string(), YamlValue::Mapping(vec![])));
+    }
+
+    #[test]
+    fn typst_export_maps_to_quarto_typst_with_output_and_template_path() {
+        let exports = exports_from(
+            "exports:\n  - format: typst\n    template: templates/paper.typ\n    output: paper.pdf\n",
+        );
+        let (field, warnings) = exports_to_format(&exports);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let YamlValue::Mapping(m) = field.unwrap().value else {
+            panic!()
+        };
+        let (key, YamlValue::Mapping(opts)) = &m[1] else {
+            panic!()
+        };
+        assert_eq!(key, "typst");
+        assert!(opts.contains(&(
+            "output-file".to_string(),
+            YamlValue::String("paper.pdf".into())
+        )));
+        assert!(opts.contains(&(
+            "template".to_string(),
+            YamlValue::String("templates/paper.typ".into())
+        )));
+    }
+
+    #[test]
+    fn a_template_name_is_not_carried_as_a_quarto_template_path() {
+        let exports = exports_from("exports:\n  - format: typst\n    template: lapreprint-typst\n");
+        let (field, _) = exports_to_format(&exports);
+        let YamlValue::Mapping(m) = field.unwrap().value else {
+            panic!()
+        };
+        let YamlValue::Mapping(opts) = &m[1].1 else {
+            panic!()
+        };
+        assert!(opts.iter().all(|(k, _)| k != "template"));
     }
 
     #[test]

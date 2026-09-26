@@ -1,7 +1,7 @@
 ---
 phase: 2
 title: Label, include and path correctness
-status: pending
+status: done
 repo: myst-quarto-rustCLI
 covers: [B1, B2, B3, B9]
 ---
@@ -30,3 +30,7 @@ covers: [B1, B2, B3, B9]
 ## Risk
 
 Existing users may already have `fig-fig-*` labels written by 0.2.0 output. Note this in the CHANGELOG. A reverse conversion through `labels.json` still maps correctly because the sidecar records the exact pair.
+
+## Result
+
+B1, B2, B3 and B9 are fixed with unit tests. The harness no longer reports doubled labels, the missing `_intro` include, or `index.qmd.qmd`. The e2e problem count fell from 53 to 41 on `ask-manuscript`. Include targets and written file names now share one rule, `writer::swap_content_extension`. A code-cell label may keep either the `fig-` or the `tbl-` prefix.

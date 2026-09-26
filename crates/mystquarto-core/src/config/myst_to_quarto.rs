@@ -392,9 +392,9 @@ fn toc_entry_file(entry: &YamlValue) -> Option<String> {
 }
 
 /// Reference §8.2's type-aware toc extension rewrite (fixes D7): `.md` ->
-/// `.qmd`, `.ipynb` unchanged, no extension gets `.qmd` appended.
+/// `.qmd`, `.ipynb` and `.qmd` unchanged, no extension gets `.qmd` appended.
 fn rewrite_content_extension(name: &str) -> String {
-    if name.ends_with(".ipynb") {
+    if name.ends_with(".ipynb") || name.ends_with(".qmd") {
         name.to_string()
     } else if let Some(stem) = name.strip_suffix(".md") {
         format!("{stem}.qmd")
@@ -461,6 +461,18 @@ fn convert_authors(authors: &[YamlValue]) -> Option<YamlValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_extension_rewrite_never_doubles_an_extension() {
+        for (input, want) in [
+            ("index.md", "index.qmd"),
+            ("manuscript/index.qmd", "manuscript/index.qmd"),
+            ("analysis.ipynb", "analysis.ipynb"),
+            ("intro", "intro.qmd"),
+        ] {
+            assert_eq!(rewrite_content_extension(input), want, "{input}");
+        }
+    }
 
     #[test]
     fn book_theme_project_places_title_and_chapters_under_book() {

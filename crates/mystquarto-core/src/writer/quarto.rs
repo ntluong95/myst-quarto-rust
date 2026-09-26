@@ -635,24 +635,11 @@ fn static_code(
     out
 }
 
+/// See the MyST writer's `myst_include_target`: the shortcode names the file
+/// exactly as written, swapping only a `.md` extension to `.qmd`.
 fn include_shortcode(target: &Path) -> String {
-    let dir = target.parent().map(Path::to_path_buf).unwrap_or_default();
-    let stem = target
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("include");
-    let stem = if let Some(stripped) = stem.strip_prefix('_') {
-        stripped
-    } else {
-        stem
-    };
-    let name = format!("_{stem}.qmd");
-    let path = if dir.as_os_str().is_empty() {
-        name
-    } else {
-        dir.join(name).display().to_string()
-    };
-    format!("{{{{< include {path} >}}}}")
+    let path = crate::writer::swap_content_extension(target, "md", "qmd");
+    format!("{{{{< include {} >}}}}", path.display())
 }
 
 fn raw(format: &str, body: &[String]) -> Vec<String> {

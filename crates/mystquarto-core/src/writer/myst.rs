@@ -502,22 +502,12 @@ impl<'a> MystWriter<'a> {
     }
 }
 
+/// The include target as written on disk: same directory and stem (a
+/// leading `_` included, since both Quarto and MyST use it to mark a
+/// partial), with only a `.qmd` extension swapped to `.md` — exactly the
+/// rename the file writer applies, so the directive always resolves.
 fn myst_include_target(target: &std::path::Path) -> std::path::PathBuf {
-    let dir = target
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_default();
-    let stem = target
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("include");
-    let stem = stem.strip_prefix('_').unwrap_or(stem);
-    let name = format!("{stem}.md");
-    if dir.as_os_str().is_empty() {
-        name.into()
-    } else {
-        dir.join(name)
-    }
+    crate::writer::swap_content_extension(target, "qmd", "md")
 }
 
 fn admonition_name(kind: AdmonitionKind) -> &'static str {
