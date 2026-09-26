@@ -23,6 +23,13 @@ pub enum StrictLevel {
     All,
 }
 
+/// `--scope`: how the conversion's file set is chosen.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    Manuscript,
+    All,
+}
+
 /// Flags shared by all three binaries for a single conversion invocation.
 /// The direction (MyST->Quarto vs. Quarto->MyST) is fixed by which binary,
 /// or which `mystquarto` subcommand, is running — it is not a flag on this
@@ -32,11 +39,20 @@ pub struct ConvertArgs {
     /// Input file or directory to convert.
     pub input: PathBuf,
 
-    /// Output directory. Defaults to `<input>-quarto` / `<input>-myst`
-    /// (matching the Python CLI). Ignored when `--in-place` is set — see
-    /// that field's doc.
+    /// Output directory (required unless `--in-place`). It must not exist,
+    /// or be empty, or hold this tool's own previous output of the same
+    /// direction; it must not sit inside the input unless gitignored.
     #[arg(short = 'o', long = "output", value_name = "DIR")]
     pub output: Option<PathBuf>,
+
+    /// Which files to read. `manuscript` (default): everything reachable
+    /// from the project config, or, without a config, a directory walk that
+    /// skips agent/tooling files (`AGENTS.md`, `CLAUDE.md`, `README.md`,
+    /// `CHANGELOG.md`, `plans/`). `all`: the directory walk without that
+    /// exclusion. `.gitignore` and the governed-location denylist apply to
+    /// both.
+    #[arg(long = "scope", value_enum, default_value_t = Scope::Manuscript)]
+    pub scope: Scope,
 
     /// Overwrite source files in place instead of writing to a separate
     /// output directory. When set, `--output` is ignored (parity with the

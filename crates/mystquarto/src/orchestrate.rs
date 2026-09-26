@@ -50,6 +50,7 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
+use mystquarto_core::closure;
 use mystquarto_core::config::snapshot::Restored;
 use mystquarto_core::diagnostics::{codes, Diagnostic, Severity};
 use mystquarto_core::fs::assets::{self, AssetCopyReport};
@@ -59,8 +60,8 @@ use mystquarto_core::pipeline::{self, BatchFileError};
 use mystquarto_core::preserve::{self, ConfigSnapshot, IgnoredConfig, PreservedEntry};
 use mystquarto_core::{notebook, registry::sidecar};
 
-use crate::args::{ConvertArgs, StrictLevel};
-use crate::discover::{self, Direction};
+use crate::args::{ConvertArgs, Scope, StrictLevel};
+use crate::discover::Direction;
 
 /// Relative path (from an output root) of the label/preservation sidecar
 /// directory.
@@ -130,10 +131,8 @@ impl RunReport {
 
     /// `true` if this run should exit non-zero regardless of `--strict`:
     /// any real (non-dry-run) file failure, or an unresolved config
-    /// conflict. Severity::Error-class diagnostics (see
-    /// `mystquarto_core::diagnostics::Severity`) already flow through this
-    /// path today via `FileStatus::Failed`, not a constructed `Diagnostic`
-    /// — see that type's docs.
+    /// conflict, or any `Severity::Error` diagnostic (a reference into a
+    /// governed location).
     #[must_use]
     pub fn has_failures(&self) -> bool {
         self.config_conflict.is_some()
@@ -141,6 +140,7 @@ impl RunReport {
                 .outcomes
                 .iter()
                 .any(|o| matches!(o.status, FileStatus::Failed(_)))
+            || self.warnings.iter().any(|d| d.severity == Severity::Error)
     }
 
     /// `true` if `strict` promotes at least one diagnostic already in
@@ -175,33 +175,69 @@ pub fn execute(args: &ConvertArgs, direction: Direction) -> Result<RunReport> {
         .with_context(|| format!("could not resolve input path {}", args.input.display()))?;
     let is_dir = input_meta.is_dir();
 
+    let input_dir = if is_dir {
+        canonical_input.clone()
+    } else {
+        canonical_input
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
+
     let output_hint = if args.in_place {
+        if input_dir.join(".ask").is_dir() {
+            bail!(
+                "--in-place refuses to run in an agent-science-kit project ({} has .ask/): \
+                 Quarto is the canonical source there. Convert into a separate directory \
+                 with -o instead.",
+                input_dir.display()
+            );
+        }
         canonical_input.clone()
     } else if let Some(explicit) = &args.output {
         explicit.clone()
     } else {
-        let base = if is_dir {
-            canonical_input.clone()
-        } else {
-            canonical_input
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from("."))
+        let name = input_dir
+            .file_name()
+            .map_or_else(|| "project".into(), |n| n.to_string_lossy().into_owned());
+        let suffix = match direction {
+            Direction::MystToQuarto => "quarto",
+            Direction::QuartoToMyst => "myst",
         };
-        default_output_dir(&base, direction)
+        bail!(
+            "-o/--output is required: the tool never picks an output location for you, so it \
+             cannot write into the project or its parent folder by accident. For example: \
+             -o \"$(mktemp -d)/{name}-{suffix}\""
+        );
     };
     let effective_output_root = path_guard::canonicalize_best_effort(&output_hint)
         .with_context(|| format!("could not resolve output path {}", output_hint.display()))?;
+
+    let previous_output = if args.in_place {
+        false
+    } else {
+        check_output_dir(&input_dir, &effective_output_root, direction)?
+    };
 
     if args.in_place && !args.dry_run {
         check_in_place_preconditions(&canonical_input, args.force)?;
     }
 
     let mut report = if is_dir {
-        execute_directory(args, direction, &canonical_input, &effective_output_root)?
+        execute_directory(
+            args,
+            direction,
+            &canonical_input,
+            &effective_output_root,
+            previous_output,
+        )?
     } else {
         execute_single_file(args, direction, &canonical_input, &effective_output_root)?
     };
+
+    if !args.dry_run && !args.in_place {
+        write_output_marker(&effective_output_root, direction)?;
+    }
 
     let suppressed = load_suppressed_codes(&canonical_input.join(SIDECAR_DIR).join(SUPPRESS_FILE));
     if !suppressed.is_empty() {
@@ -209,6 +245,85 @@ pub fn execute(args: &ConvertArgs, direction: Direction) -> Result<RunReport> {
     }
 
     Ok(report)
+}
+
+/// Marks an output directory as this tool's own, so a later run of the same
+/// direction may write into it again. Deterministic content, so converting
+/// twice stays byte-identical.
+const OUTPUT_MARKER_FILE: &str = "output.json";
+
+fn direction_name(direction: Direction) -> &'static str {
+    match direction {
+        Direction::MystToQuarto => "to-quarto",
+        Direction::QuartoToMyst => "to-myst",
+    }
+}
+
+fn write_output_marker(output_root: &Path, direction: Direction) -> Result<()> {
+    let path = output_root.join(SIDECAR_DIR).join(OUTPUT_MARKER_FILE);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("could not create {}", parent.display()))?;
+    }
+    let text = format!(
+        "{{\"tool\": \"mystquarto\", \"direction\": \"{}\"}}\n",
+        direction_name(direction)
+    );
+    write_atomic(&path, text.as_bytes())
+        .with_context(|| format!("could not write {}", path.display()))
+}
+
+fn read_output_marker(output_root: &Path) -> Option<String> {
+    let text = fs::read_to_string(output_root.join(SIDECAR_DIR).join(OUTPUT_MARKER_FILE)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    (value.get("tool")?.as_str()? == "mystquarto")
+        .then(|| value.get("direction")?.as_str().map(str::to_string))
+        .flatten()
+}
+
+/// The output-directory rules. The output must not sit inside the input
+/// unless gitignored, and it must not exist, be empty, or be this tool's
+/// own previous output of the same direction. Anything else — above all an
+/// existing project — is refused before a byte is written, so a conversion
+/// can never merge into one. Returns `true` for a previous output.
+fn check_output_dir(input_dir: &Path, output_root: &Path, direction: Direction) -> Result<bool> {
+    let refuse = |why: String| -> Result<bool> {
+        bail!(
+            "{}: refusing output directory {}: {why}",
+            codes::io::OUTPUT_DIR_REFUSED,
+            output_root.display()
+        )
+    };
+    if path_guard::is_descendant(input_dir, output_root)
+        && (output_root == input_dir || !closure::is_gitignored_dir(input_dir, output_root))
+    {
+        return refuse(format!(
+            "it is inside the input {} and not gitignored; choose a directory outside the \
+             project (for example under $(mktemp -d)) or a gitignored one",
+            input_dir.display()
+        ));
+    }
+    let entries = match fs::read_dir(output_root) {
+        Ok(entries) => entries,
+        Err(_) if !output_root.exists() => return Ok(false),
+        Err(e) => return refuse(format!("it cannot be read as a directory ({e})")),
+    };
+    if entries.count() == 0 {
+        return Ok(false);
+    }
+    match read_output_marker(output_root) {
+        Some(d) if d == direction_name(direction) => Ok(true),
+        Some(d) => refuse(format!(
+            "it holds this tool's `{d}` output, not `{}` output; use a separate directory",
+            direction_name(direction)
+        )),
+        None => refuse(
+            "it exists and is not empty, and it is not this tool's previous output. A \
+             conversion never merges into an existing project; use a new or empty directory \
+             and move the files you want by hand"
+                .to_string(),
+        ),
+    }
 }
 
 /// Reads `.mystquarto/suppress.toml`'s `codes = ["MQ0410", ...]` array, as
@@ -247,13 +362,34 @@ fn execute_directory(
     direction: Direction,
     canonical_input: &Path,
     effective_output_root: &Path,
+    previous_output: bool,
 ) -> Result<RunReport> {
-    let discovered =
-        discover::discover_files(canonical_input, direction, Some(effective_output_root));
     let source_config_name = direction.source_config_name();
-    let (config_files, content_files): (Vec<PathBuf>, Vec<PathBuf>) = discovered
-        .into_iter()
-        .partition(|p| p.file_name().and_then(|n| n.to_str()) == Some(source_config_name));
+    let root_config = canonical_input.join(source_config_name);
+    let config_files: Vec<PathBuf> = if root_config.is_file() {
+        vec![root_config.clone()]
+    } else {
+        Vec::new()
+    };
+    let dialect = match direction {
+        Direction::MystToQuarto => closure::ConfigDialect::Myst,
+        Direction::QuartoToMyst => closure::ConfigDialect::Quarto,
+    };
+    let start = match (args.scope, config_files.is_empty()) {
+        (Scope::All, _) => closure::Start::Walk { all: true },
+        (Scope::Manuscript, true) => closure::Start::Walk { all: false },
+        (Scope::Manuscript, false) => closure::Start::Config {
+            path: &root_config,
+            dialect,
+        },
+    };
+    let file_set = closure::resolve(&closure::Request {
+        root: canonical_input,
+        output_root: Some(effective_output_root),
+        source_ext: direction.source_extension(),
+        start,
+    });
+    let content_files = file_set.content.clone();
 
     if !args.dry_run {
         fs::create_dir_all(effective_output_root).with_context(|| {
@@ -266,7 +402,17 @@ fn execute_directory(
 
     let mut outcomes = Vec::new();
     let mut config_conflict = None;
-    let mut warnings: Vec<Diagnostic> = Vec::new();
+    let mut warnings: Vec<Diagnostic> = file_set.diagnostics.clone();
+    for path in &file_set.skipped_symlinks {
+        warnings.push(
+            Diagnostic::new(
+                Severity::Warning,
+                codes::io::SYMLINK_ASSET_SKIPPED,
+                "symlink skipped without dereferencing its target".to_string(),
+            )
+            .with_file(path.clone()),
+        );
+    }
 
     // Batch-convert every content file up front (Phase 5's run-scoped
     // `LabelRegistry` requires seeing every document before deciding any
@@ -278,8 +424,8 @@ fn execute_directory(
     } else {
         Some(run_content_batch(
             &content_files,
+            &file_set.notebooks,
             canonical_input,
-            effective_output_root,
             direction,
         ))
     };
@@ -308,7 +454,9 @@ fn execute_directory(
                 continue;
             }
 
-            if out_config_path.exists() && !args.force {
+            // A previous output's config is this tool's own; only a
+            // hand-authored one (possible under --in-place) needs --force.
+            if out_config_path.exists() && !args.force && !previous_output {
                 let conflict_path = alongside_new_path(&out_config_path);
                 outcomes.push(FileOutcome {
                     input: config_path.clone(),
@@ -431,18 +579,14 @@ fn execute_directory(
         }
 
         if !args.in_place && !args.dry_run {
-            let content_ext = [direction.source_extension()];
-            // Both dialects' configs: the source one was converted above,
-            // and a target-dialect one in the input is a stale source
-            // artifact that must never overwrite the converted config.
-            let config_names = [source_config_name, direction.target_config_name()];
-            let report = assets::copy_assets(
-                canonical_input,
-                effective_output_root,
-                &content_ext,
-                &config_names,
-            )
-            .context("asset copy failed")?;
+            let files: Vec<PathBuf> = file_set
+                .assets
+                .iter()
+                .chain(&file_set.notebooks)
+                .cloned()
+                .collect();
+            let report = assets::copy_files(canonical_input, effective_output_root, &files)
+                .context("asset copy failed")?;
             for path in &report.skipped_symlinks {
                 warnings.push(
                     Diagnostic::new(
@@ -555,16 +699,14 @@ impl ContentBatch {
 /// [`relabel_and_write_sidecar`]'s call site.
 fn run_content_batch(
     content_files: &[PathBuf],
+    notebooks: &[PathBuf],
     canonical_input: &Path,
-    effective_output_root: &Path,
     direction: Direction,
 ) -> ContentBatch {
-    let notebooks = discover::discover_notebooks(canonical_input, Some(effective_output_root));
-
     match direction {
         Direction::MystToQuarto => {
             let result =
-                pipeline::convert_myst_to_quarto_batch(content_files, &notebooks, canonical_input);
+                pipeline::convert_myst_to_quarto_batch(content_files, notebooks, canonical_input);
             ContentBatch::MystToQuarto {
                 rendered: result.rendered,
                 errors: result.errors,
@@ -580,7 +722,7 @@ fn run_content_batch(
             let sidecar_path = sidecar_path.exists().then_some(sidecar_path);
             let result = pipeline::convert_quarto_to_myst_batch(
                 content_files,
-                &notebooks,
+                notebooks,
                 canonical_input,
                 sidecar_path.as_deref(),
             );
@@ -1171,10 +1313,16 @@ fn execute_single_file(
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
+    let file_set = closure::resolve(&closure::Request {
+        root: &input_root,
+        output_root: Some(effective_output_root),
+        source_ext: direction.source_extension(),
+        start: closure::Start::Files(std::slice::from_ref(&canonical_input_file.to_path_buf())),
+    });
     let batch = run_content_batch(
         std::slice::from_ref(&canonical_input_file.to_path_buf()),
+        &file_set.notebooks,
         &input_root,
-        effective_output_root,
         direction,
     );
     let mut warnings: Vec<Diagnostic> = batch.warnings_ref().to_vec();
@@ -1281,19 +1429,6 @@ fn alongside_new_path(path: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
-/// `<input>-quarto` / `<input>-myst` — ported from `_default_output_dir`
-/// (`convert.py:208-219`): the suffix is appended to the input path's own
-/// name, producing a sibling directory, not a subdirectory.
-fn default_output_dir(input_dir: &Path, direction: Direction) -> PathBuf {
-    let suffix = match direction {
-        Direction::MystToQuarto => "-quarto",
-        Direction::QuartoToMyst => "-myst",
-    };
-    let mut os = input_dir.as_os_str().to_os_string();
-    os.push(suffix);
-    PathBuf::from(os)
-}
-
 /// Prints a summary of `report` (matching the shape of the Python CLI's own
 /// `_run_conversion` output closely enough to be recognizable, not
 /// byte-for-byte — the phase spec asks for *documented* semantics, not
@@ -1362,7 +1497,12 @@ pub fn print_summary(report: &RunReport, dry_run: bool, strict: Option<StrictLev
         .iter()
         .filter(|o| matches!(o.status, FileStatus::Failed(_)))
         .count()
-        + usize::from(report.config_conflict.is_some());
+        + usize::from(report.config_conflict.is_some())
+        + report
+            .warnings
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .count();
     let warning_count = report
         .warnings
         .iter()
@@ -1473,7 +1613,16 @@ mod tests {
             strict: None,
             force: false,
             no_label_map: false,
+            scope: Scope::Manuscript,
         }
+    }
+
+    /// Creates `tmp/in` as the input, so `tmp/out` is a sibling rather than
+    /// a directory inside the input.
+    fn input_dir(tmp: &Path) -> PathBuf {
+        let dir = tmp.join("in");
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     fn write_myst_project(dir: &Path) {
@@ -1507,10 +1656,11 @@ mod tests {
     #[test]
     fn non_in_place_run_produces_an_outcome_per_discovered_content_file() {
         let tmp = tempdir("outcome-per-file");
-        write_myst_project(&tmp);
+        let input = input_dir(&tmp);
+        write_myst_project(&input);
         let output_dir = tmp.join("out");
 
-        let mut args = base_args(tmp.clone());
+        let mut args = base_args(input);
         args.output = Some(output_dir);
         let report = execute(&args, Direction::MystToQuarto).unwrap();
 
@@ -1533,13 +1683,10 @@ mod tests {
     }
 
     #[test]
-    fn output_pointed_at_the_input_tree_without_in_place_still_refuses_to_mutate_notebooks() {
-        // H1 regression: `-o` aimed back at (or inside) the input tree
-        // bypasses the clean-VCS gate and the config-overwrite gate, both
-        // of which key off `args.in_place` alone — but notebook
-        // relabelling and the sidecar write must *not* follow that same
-        // flag-only gate, because they mutate a file regardless of which
-        // flag caused the output root to land inside the input tree.
+    fn output_pointed_at_the_input_tree_is_refused_before_anything_is_written() {
+        // H1 regression, now closed at the door: `-o` aimed back at (or
+        // inside, when not gitignored) the input tree is refused outright,
+        // so no notebook, sidecar or content file there can be mutated.
         let tmp = tempdir("output-into-input-no-in-place");
         fs::write(tmp.join("myst.yml"), "project:\n  title: Test\n").unwrap();
         fs::write(
@@ -1550,31 +1697,141 @@ mod tests {
         let notebook_source =
             "{\"cells\":[{\"cell_type\":\"code\",\"source\":[\"#| label: nb:analysis\\n\"]}]}";
         fs::write(tmp.join("analysis.ipynb"), notebook_source).unwrap();
+        let before = snapshot(&tmp);
+
+        for output in [tmp.clone(), tmp.join("converted")] {
+            let mut args = base_args(tmp.clone());
+            args.output = Some(output);
+            let err = execute(&args, Direction::MystToQuarto)
+                .expect_err("an output inside the input must be refused");
+            assert!(
+                format!("{err}").contains(codes::io::OUTPUT_DIR_REFUSED),
+                "{err}"
+            );
+        }
+        assert_eq!(snapshot(&tmp), before, "nothing may be written");
+
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn a_figure_in_the_raw_data_tier_fails_the_run_and_is_never_copied() {
+        let tmp = tempdir("denied-figure");
+        let input = input_dir(&tmp);
+        let raw_tier = ["data", "raw"].join("/");
+        fs::create_dir_all(input.join(&raw_tier)).unwrap();
+        fs::write(input.join(&raw_tier).join("plot.png"), "secret").unwrap();
+        fs::write(
+            input.join("myst.yml"),
+            "version: 1\nproject:\n  toc:\n    - file: index.md\n",
+        )
+        .unwrap();
+        fs::write(
+            input.join("index.md"),
+            format!("# Result\n\n![Plot]({raw_tier}/plot.png)\n"),
+        )
+        .unwrap();
+
+        let mut args = base_args(input);
+        args.output = Some(tmp.join("out"));
+        let report = execute(&args, Direction::MystToQuarto).unwrap();
+
+        assert!(report.has_failures());
+        assert!(report
+            .warnings
+            .iter()
+            .any(|d| d.code == codes::io::DENIED_REFERENCE && d.severity == Severity::Error));
+        assert!(!tmp.join("out").join(&raw_tier).exists());
+
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn a_gitignored_output_inside_the_input_is_allowed() {
+        let tmp = tempdir("gitignored-output");
+        write_myst_project(&tmp);
+        fs::write(tmp.join(".gitignore"), "_build/\n").unwrap();
 
         let mut args = base_args(tmp.clone());
-        args.output = Some(tmp.clone()); // -o pointed at the input tree itself
-        args.in_place = false; // the flag the original bug keyed off of
-        args.no_config = true; // isolate this test to the notebook-relabel gate under test
-
+        args.output = Some(tmp.join("_build/quarto"));
         let report = execute(&args, Direction::MystToQuarto).unwrap();
         assert!(!report.has_failures(), "{:?}", report.outcomes);
+        assert!(tmp.join("_build/quarto/intro.qmd").exists());
 
-        // The source notebook must be byte-identical — never relabelled.
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn a_missing_output_is_an_error_that_suggests_a_path() {
+        let tmp = tempdir("no-output");
+        write_myst_project(&tmp);
+        let err =
+            execute(&base_args(tmp.clone()), Direction::MystToQuarto).expect_err("-o is required");
+        let text = format!("{err}");
+        assert!(text.contains("-o/--output is required"), "{text}");
+        assert!(text.contains("mktemp -d"), "{text}");
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn in_place_is_refused_in_an_agent_science_kit_project() {
+        let tmp = tempdir("in-place-ask");
+        write_myst_project(&tmp);
+        fs::create_dir_all(tmp.join(".ask")).unwrap();
+        let mut args = base_args(tmp.clone());
+        args.in_place = true;
+        args.force = true;
+        let err = execute(&args, Direction::MystToQuarto).expect_err("must refuse");
+        assert!(format!("{err}").contains(".ask"), "{err}");
+        assert!(tmp.join("intro.md").exists());
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn an_existing_project_is_refused_as_output_even_with_force() {
+        let tmp = tempdir("existing-project-output");
+        let input = input_dir(&tmp);
+        write_myst_project(&input);
+        let existing = tmp.join("ask-repo");
+        fs::create_dir_all(existing.join(".ask")).unwrap();
+        fs::write(existing.join("_quarto.yml"), "hand: authored\n").unwrap();
+
+        for force in [false, true] {
+            let mut args = base_args(input.clone());
+            args.output = Some(existing.clone());
+            args.force = force;
+            let err = execute(&args, Direction::MystToQuarto).expect_err("must refuse");
+            assert!(
+                format!("{err}").contains(codes::io::OUTPUT_DIR_REFUSED),
+                "{err}"
+            );
+        }
         assert_eq!(
-            fs::read_to_string(tmp.join("analysis.ipynb")).unwrap(),
-            notebook_source
+            fs::read_to_string(existing.join("_quarto.yml")).unwrap(),
+            "hand: authored\n"
         );
-        // No sidecar written into the source tree.
-        assert!(!tmp.join(".mystquarto").join("labels.json").exists());
-        // The skip is surfaced, not silent.
-        assert!(
-            report
-                .warnings
-                .iter()
-                .any(|w| w.message.contains("output writes into the input tree")),
-            "{:?}",
-            report.warnings
-        );
+        assert!(!existing.join("intro.qmd").exists());
+
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn a_previous_output_of_the_same_direction_is_reused_but_not_of_the_other() {
+        let tmp = tempdir("previous-output");
+        let input = input_dir(&tmp);
+        write_myst_project(&input);
+        let output = tmp.join("out");
+
+        let mut args = base_args(input.clone());
+        args.output = Some(output.clone());
+        execute(&args, Direction::MystToQuarto).unwrap();
+        let again = execute(&args, Direction::MystToQuarto).unwrap();
+        assert!(!again.has_failures(), "{:?}", again.outcomes);
+        assert_eq!(again.config_conflict, None);
+
+        fs::write(input.join("_quarto.yml"), "project:\n  type: default\n").unwrap();
+        let err = execute(&args, Direction::QuartoToMyst).expect_err("other direction");
+        assert!(format!("{err}").contains("to-quarto"), "{err}");
 
         cleanup(&tmp);
     }
@@ -1780,65 +2037,19 @@ mod tests {
     }
 
     #[test]
-    fn config_overwrite_without_force_reports_a_conflict_and_does_not_touch_the_existing_file() {
-        let tmp = tempdir("config-conflict");
-        write_myst_project(&tmp);
-        let output_dir = tmp.join("out");
-        fs::create_dir_all(&output_dir).unwrap();
-        let existing = output_dir.join("_quarto.yml");
-        fs::write(&existing, "hand: authored\n").unwrap();
-
-        let mut args = base_args(tmp.clone());
-        args.output = Some(output_dir.clone());
-        let report = execute(&args, Direction::MystToQuarto).unwrap();
-
-        assert_eq!(
-            report.config_conflict,
-            Some(output_dir.join("_quarto.yml.new"))
-        );
-        assert_eq!(fs::read_to_string(&existing).unwrap(), "hand: authored\n");
-        // `.new` is a *reported* conflict path, never an actually written
-        // file — see `RunReport::config_conflict`'s docs.
-        assert!(!output_dir.join("_quarto.yml.new").exists());
-        assert!(report.has_failures());
-
-        cleanup(&tmp);
-    }
-
-    #[test]
-    fn config_overwrite_with_force_does_not_report_a_conflict() {
-        let tmp = tempdir("config-force");
-        write_myst_project(&tmp);
-        let output_dir = tmp.join("out");
-        fs::create_dir_all(&output_dir).unwrap();
-        let existing = output_dir.join("_quarto.yml");
-        fs::write(&existing, "hand: authored\n").unwrap();
-
-        let mut args = base_args(tmp.clone());
-        args.output = Some(output_dir.clone());
-        args.force = true;
-        let report = execute(&args, Direction::MystToQuarto).unwrap();
-
-        assert_eq!(report.config_conflict, None);
-        // --force allows the overwrite, and the write is now a real,
-        // converted `_quarto.yml` — not the hand-authored placeholder.
-        assert_eq!(fs::read_to_string(&existing).unwrap(), "title: Test\n");
-
-        cleanup(&tmp);
-    }
-
-    #[test]
     fn a_config_write_failure_is_a_failed_outcome_and_a_non_zero_exit() {
         let tmp = tempdir("config-write-fails");
-        write_myst_project(&tmp);
+        let input = input_dir(&tmp);
+        write_myst_project(&input);
         let output_dir = tmp.join("out");
         // A directory where the config file must go makes the write fail
-        // while every content file still converts.
+        // while every content file still converts. The marker makes the
+        // directory this tool's own previous output, so it is not refused.
         fs::create_dir_all(output_dir.join("_quarto.yml")).unwrap();
+        write_output_marker(&output_dir, Direction::MystToQuarto).unwrap();
 
-        let mut args = base_args(tmp.clone());
+        let mut args = base_args(input);
         args.output = Some(output_dir);
-        args.force = true;
         let report = execute(&args, Direction::MystToQuarto).unwrap();
 
         assert!(report.has_failures());
@@ -1944,8 +2155,9 @@ mod tests {
         .unwrap();
 
         let mut args = base_args(tmp.clone());
-        args.output = Some(tmp.join("out"));
+        args.output = Some(tmp.with_extension("out"));
         let report = execute(&args, Direction::MystToQuarto).unwrap();
+        cleanup(&tmp.with_extension("out"));
         let missing: Vec<_> = report
             .warnings
             .iter()
@@ -1966,10 +2178,11 @@ mod tests {
             (true, false, false),
         ] {
             let tmp = tempdir("dry-run-zero-bytes");
-            write_myst_project(&tmp);
+            let input = input_dir(&tmp);
+            write_myst_project(&input);
             let before = snapshot(&tmp);
 
-            let mut args = base_args(tmp.clone());
+            let mut args = base_args(input);
             args.dry_run = true;
             args.in_place = in_place;
             args.config_only = config_only;

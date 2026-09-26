@@ -910,7 +910,7 @@ mod tests {
             let mut start = 0;
             while let Some(rel) = out[start..].find(&pattern) {
                 let end = start + rel + pattern.len();
-                if out[end..].chars().next().map_or(true, is_boundary) {
+                if out[end..].chars().next().is_none_or(is_boundary) {
                     return true;
                 }
                 start = start + rel + 1;

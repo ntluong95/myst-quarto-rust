@@ -45,7 +45,19 @@ fn tempdir(label: &str) -> PathBuf {
         .unwrap_or(0);
     let dir = std::env::temp_dir().join(format!("mystquarto-cli-test-{label}-{nanos}-{n}"));
     fs::create_dir_all(&dir).unwrap();
+    // Most tests write their output to `<tmp>/output` (or the D16 fixture's
+    // `<tmp>/docs-quarto`). An output inside the input is only allowed when
+    // gitignored, which is exactly how a project keeps a local preview.
+    fs::write(dir.join(".gitignore"), "output/\ndocs-quarto/\n").unwrap();
     dir.canonicalize().unwrap()
+}
+
+/// A fresh, empty directory for a conversion's output (no `.gitignore`,
+/// which would make it a non-empty, foreign directory the tool refuses).
+fn outdir(label: &str) -> PathBuf {
+    let dir = tempdir(label);
+    fs::remove_file(dir.join(".gitignore")).unwrap();
+    dir
 }
 
 fn cleanup(dir: &Path) {
@@ -163,7 +175,7 @@ mod warning_collector {
         .unwrap();
         fs::write(tmp.join("index.qmd"), "# Index\n").unwrap();
         fs::write(tmp.join("a.qmd"), "# A\n").unwrap();
-        let output_dir = tempdir("warning-file-line-out");
+        let output_dir = outdir("warning-file-line-out");
 
         let assert = quarto2myst_cmd()
             .arg(&tmp)
@@ -197,7 +209,7 @@ mod warning_collector {
         .unwrap();
         fs::write(tmp.join("index.qmd"), "# Index\n").unwrap();
 
-        let out1 = tempdir("strict-promotes-out1");
+        let out1 = outdir("strict-promotes-out1");
         quarto2myst_cmd()
             .arg(&tmp)
             .arg("-o")
@@ -205,7 +217,7 @@ mod warning_collector {
             .assert()
             .success();
 
-        let out2 = tempdir("strict-promotes-out2");
+        let out2 = outdir("strict-promotes-out2");
         quarto2myst_cmd()
             .arg(&tmp)
             .arg("-o")
@@ -234,7 +246,7 @@ mod warning_collector {
         fs::write(tmp.join("index.qmd"), "# Index\n").unwrap();
         fs::write(tmp.join("a.qmd"), "# A\n").unwrap();
 
-        let out1 = tempdir("strict-all-promotes-out1");
+        let out1 = outdir("strict-all-promotes-out1");
         quarto2myst_cmd()
             .arg(&tmp)
             .arg("-o")
@@ -243,7 +255,7 @@ mod warning_collector {
             .assert()
             .success();
 
-        let out2 = tempdir("strict-all-promotes-out2");
+        let out2 = outdir("strict-all-promotes-out2");
         quarto2myst_cmd()
             .arg(&tmp)
             .arg("-o")
@@ -266,7 +278,7 @@ mod warning_collector {
         let tmp = tempdir("has-errors");
         fs::write(tmp.join("myst.yml"), "project:\n  title: T\n").unwrap();
         fs::write(tmp.join("broken.md"), [0xFF, 0xFE, 0x00, 0x01]).unwrap();
-        let output_dir = tempdir("has-errors-out");
+        let output_dir = outdir("has-errors-out");
 
         myst2quarto_cmd()
             .arg(&tmp)
@@ -287,7 +299,7 @@ mod warning_collector {
         // including zeros, not just when something is actually wrong.
         let tmp = tempdir("report-format-clean");
         fs::write(tmp.join("doc.md"), "# Hello\n").unwrap();
-        let output_dir = tempdir("report-format-clean-out");
+        let output_dir = outdir("report-format-clean-out");
 
         let assert = myst2quarto_cmd()
             .arg(tmp.join("doc.md"))
@@ -325,7 +337,7 @@ mod warning_collector {
             "codes = [\"MQ0403\"]\n",
         )
         .unwrap();
-        let output_dir = tempdir("suppress-toml-out");
+        let output_dir = outdir("suppress-toml-out");
 
         let assert = quarto2myst_cmd()
             .arg(&tmp)
@@ -343,80 +355,6 @@ mod warning_collector {
 
         cleanup(&tmp);
         cleanup(&output_dir);
-    }
-}
-
-// =======================================================================
-// Ports tests/test_cli.py::TestDiscoverFiles (4 bucket-B tests, all real).
-// =======================================================================
-mod discover_files {
-    use super::*;
-    use mystquarto::discover::{discover_files, Direction};
-
-    #[test]
-    fn test_discover_myst_files() {
-        let tmp = tempdir("discover-myst");
-        myst_project(&tmp);
-
-        let files = discover_files(&tmp, Direction::MystToQuarto, None);
-        let names: Vec<String> = files
-            .iter()
-            .filter_map(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .collect();
-
-        assert!(names.contains(&"intro.md".to_string()));
-        assert!(names.contains(&"methods.md".to_string()));
-        assert!(names.contains(&"myst.yml".to_string()));
-        assert!(!names.contains(&"helper.py".to_string()));
-
-        cleanup(&tmp);
-    }
-
-    #[test]
-    fn test_discover_quarto_files() {
-        let tmp = tempdir("discover-quarto");
-        quarto_project(&tmp);
-
-        let files = discover_files(&tmp, Direction::QuartoToMyst, None);
-        let names: Vec<String> = files
-            .iter()
-            .filter_map(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .collect();
-
-        assert!(names.contains(&"intro.qmd".to_string()));
-        assert!(names.contains(&"methods.qmd".to_string()));
-        assert!(names.contains(&"_quarto.yml".to_string()));
-        assert!(!names.contains(&"helper.py".to_string()));
-
-        cleanup(&tmp);
-    }
-
-    #[test]
-    fn test_discover_myst_no_config() {
-        let tmp = tempdir("discover-no-config");
-        fs::write(tmp.join("doc.md"), "# Hello\n").unwrap();
-
-        let files = discover_files(&tmp, Direction::MystToQuarto, None);
-        let names: Vec<String> = files
-            .iter()
-            .filter_map(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .collect();
-
-        assert!(names.contains(&"doc.md".to_string()));
-        assert!(!names.contains(&"myst.yml".to_string()));
-
-        cleanup(&tmp);
-    }
-
-    #[test]
-    fn test_discover_empty_directory() {
-        let tmp = tempdir("discover-empty");
-        let files = discover_files(&tmp, Direction::MystToQuarto, None);
-        assert_eq!(files, Vec::<PathBuf>::new());
-        cleanup(&tmp);
     }
 }
 
@@ -624,24 +562,34 @@ mod convert_directory {
 
     #[test]
     fn test_non_markdown_copied_as_assets() {
+        // An unreferenced helper script is outside the manuscript closure,
+        // so a default run leaves it out; `--scope all` copies it.
         let tmp = tempdir("non-markdown-assets");
         myst_project(&tmp);
-        let output_dir = tmp.join("output");
 
+        let closure_out = tmp.join("output");
         myst2quarto_cmd()
             .arg(&tmp)
             .arg("-o")
-            .arg(&output_dir)
-            .output()
-            .unwrap();
+            .arg(&closure_out)
+            .assert()
+            .success();
+        assert!(!closure_out.join("helper.py").exists());
 
-        assert!(
-            output_dir.join("helper.py").exists(),
-            "non-Markdown assets must be copied to the output even though \
-             content-file conversion is stubbed this phase"
-        );
+        let all_out = outdir("non-markdown-assets-all");
+        myst2quarto_cmd()
+            .arg(&tmp)
+            .arg("-o")
+            .arg(&all_out)
+            .arg("--scope")
+            .arg("all")
+            .assert()
+            .success();
+        assert!(all_out.join("helper.py").exists());
+        assert!(all_out.join("chapters/chapter1.qmd").exists());
 
         cleanup(&tmp);
+        cleanup(&all_out);
     }
 
     #[test]
@@ -819,25 +767,26 @@ mod convert_directory {
     }
 
     #[test]
-    fn test_default_output_dir() {
+    fn test_missing_output_is_refused_and_writes_nothing() {
         let tmp = tempdir("default-output-dir");
         myst_project(&tmp);
+        let before = tree_snapshot(&tmp);
 
-        myst2quarto_cmd().arg(&tmp).output().unwrap();
+        myst2quarto_cmd()
+            .arg(&tmp)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("-o/--output is required"));
 
-        let expected_dir = {
+        let sibling = {
             let mut os = tmp.as_os_str().to_os_string();
             os.push("-quarto");
             PathBuf::from(os)
         };
-        assert!(
-            expected_dir.is_dir(),
-            "expected default output dir {} to be created",
-            expected_dir.display()
-        );
+        assert!(!sibling.exists(), "no sibling output may be created");
+        assert_eq!(tree_snapshot(&tmp), before);
 
         cleanup(&tmp);
-        cleanup(&expected_dir);
     }
 
     #[test]
@@ -979,7 +928,7 @@ mod cli_options {
     fn test_output_option() {
         let tmp = tempdir("cli-options-output");
         myst_project(&tmp);
-        let output_dir = tmp.join("custom_output");
+        let output_dir = outdir("cli-options-custom-output");
 
         // --no-config: see `test_in_place_modifies_source`'s comment.
         myst2quarto_cmd()
@@ -994,6 +943,7 @@ mod cli_options {
         assert!(output_dir.join("intro.qmd").exists());
 
         cleanup(&tmp);
+        cleanup(&output_dir);
     }
 
     #[test]
@@ -1112,7 +1062,7 @@ mod cli_options {
         // the input tree triggers the (correct, unrelated) H1
         // output-writes-into-input-tree warning, which `--strict` now
         // legitimately promotes; that is not what this test is about.
-        let output_dir = tempdir("cli-options-strict-out");
+        let output_dir = outdir("cli-options-strict-out");
 
         // A conversion with nothing lossy in it succeeds under --strict.
         myst2quarto_cmd()
@@ -1274,7 +1224,14 @@ fn symlink_assets_are_skipped_end_to_end() {
     let secret = tempdir("e2e-symlink-secret");
     fs::write(secret.join("secret.txt"), "do not copy\n").unwrap();
     std::os::unix::fs::symlink(secret.join("secret.txt"), tmp.join("linked-secret.txt")).unwrap();
-    let output_dir = tempdir("e2e-symlink-skip-out");
+    // Referenced by the manuscript, so the closure reaches (and refuses) it.
+    let intro = fs::read_to_string(tmp.join("intro.md")).unwrap();
+    fs::write(
+        tmp.join("intro.md"),
+        format!("{intro}\n[secret](linked-secret.txt)\n"),
+    )
+    .unwrap();
+    let output_dir = outdir("e2e-symlink-skip-out");
 
     let assert = myst2quarto_cmd()
         .arg(&tmp)
@@ -1314,7 +1271,7 @@ fn include_traversal_is_preserved_with_a_strict_all_diagnostic() {
         "# Index\n\n```{include} ../secret.md\n```\n",
     )
     .unwrap();
-    let output_dir = tempdir("e2e-include-traversal-out");
+    let output_dir = outdir("e2e-include-traversal-out");
 
     let assert = myst2quarto_cmd()
         .arg(&input)
@@ -1347,7 +1304,7 @@ fn d12_fixture_strict_now_fails_on_real_warnings() {
         .join("tests/corpus/defects/d12-silent-warnings/input_dir")
         .canonicalize()
         .unwrap();
-    let output_dir = tempdir("e2e-d12-out");
+    let output_dir = outdir("e2e-d12-out");
 
     let assert = myst2quarto_cmd()
         .arg(fixture)
@@ -1413,7 +1370,7 @@ fn foreign_dialect_preservation_sidecar_is_not_reparsed_by_the_cli() {
         "{\n  \"version\": 1,\n  \"entries\": {\n    \"evil\": {\n      \"file\": \"article.md\",\n      \"line\": 1,\n      \"code\": \"MQ0201\",\n      \"kind\": \"hostile\",\n      \"dialect\": \"Myst\",\n      \"original\": [\"```{glossary}\", \"term\", \": definition\", \"```\"]\n    }\n  }\n}\n",
     )
     .unwrap();
-    let output_dir = tempdir("e2e-foreign-sidecar-out");
+    let output_dir = outdir("e2e-foreign-sidecar-out");
 
     quarto2myst_cmd()
         .arg(&tmp)

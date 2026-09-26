@@ -176,4 +176,16 @@ pub mod io {
     /// A path-safety check refused an include or embed target (escapes root,
     /// include cycle, depth exceeded, or absolute target). Severity: Warning.
     pub const PATH_SAFETY_REFUSED: &str = "MQ0605";
+    /// The manuscript closure references a file in a governed location
+    /// (raw data, original literature, `.ask/`, `.git/`, `.env*`). The file
+    /// is never read or copied, and the run fails. Severity: Error.
+    pub const DENIED_REFERENCE: &str = "MQ0606";
+    /// The manuscript closure references a gitignored file (or one in a
+    /// build/cache folder); it was not copied. Severity: Warning.
+    pub const CLOSURE_FILE_IGNORED: &str = "MQ0607";
+    /// The output directory was refused before anything was written: it
+    /// exists and is neither empty nor this tool's own previous output of
+    /// the same direction, or it sits inside the input and is not
+    /// gitignored. Reported as the run's error message. Severity: Error.
+    pub const OUTPUT_DIR_REFUSED: &str = "MQ0608";
 }

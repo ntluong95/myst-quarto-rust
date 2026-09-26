@@ -1,7 +1,7 @@
 ---
 phase: 4
 title: Manuscript-scoped closure and output safety
-status: pending
+status: done
 repo: myst-quarto-rustCLI
 covers: ["§4.1 copy-everything", "§4.2 convert-every-md", "§4.3 sibling default output", "§4.4 sidecar", "decision 1"]
 ---
@@ -56,3 +56,13 @@ config (_quarto.yml / myst.yml)
 - The source dir's `git status --porcelain` is empty after every run.
 - Unit tests cover each output-dir rule, including refusing an existing ASK repo as the output.
 - The user's manual repro script from the review (`/tmp/mq-raw-test`) prints no raw files.
+
+## Result
+
+The harness reports no closure problems. The ASK fixture's output matches `expected-closure.txt` exactly, and the runtime raw-data file never reaches the output. `ask-manuscript` went from 23 to 14 problems, all of them phase 6 syntax issues.
+
+- `mystquarto-core/src/closure.rs` resolves the file set in three modes: config closure, explicit files (for phase 5), and a filtered walk. It applies the denylist (MQ0606, Error, fails the run), `.gitignore` (MQ0607, Warning), the agent-file exclusion (walk mode only), and never follows symlinks. `fs::assets::copy_files` copies an explicit list. The old directory walkers in `discover.rs` and `assets.rs` are gone, and so is the `walkdir` dependency.
+- Output rules: `-o` is required, and the error suggests `$(mktemp -d)/<name>-<dialect>`. The output directory must be new, empty, or carry `.mystquarto/output.json` for the same direction. An output inside the input is refused unless gitignored (checked against every `.gitignore` between the root and the output). All of these are MQ0608, and `--force` does not bypass them. `--in-place` is refused when the root holds `.ask/`.
+- Found on the real `submission-myst-full-main` copy: a `myst.yml` without `toc` makes MyST build every document, so it now falls back to the filtered walk. Root `.bib` files are included when no `bibliography` is named (MyST loads them automatically). `_extensions/` is carried in both directions so Quarto still renders after a round trip.
+- `ignore` 0.4.33 needs Rust 1.88, so `rust-version` went from 1.80 to 1.88 (called out in the 0.3.0 CHANGELOG).
+- `/tmp/mq-raw-test` from the review does not exist, so it could not be run. The e2e harness does the equivalent check on every run.

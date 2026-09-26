@@ -5,7 +5,7 @@
 name = "mystquarto"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.88"
 description = "Bidirectional MyST <-> Quarto converter"
 license = "MIT-0"
 repository = "https://github.com/ntluong95/myst-quarto-rustCLI"
@@ -30,8 +30,8 @@ path = "src/bin/quarto2myst.rs"
 [dependencies]
 mystquarto-core = { path = "../mystquarto-core", version = "0.2.0" }
 clap = { version = "4", features = ["derive"] }
-walkdir = "2.5"
 anyhow = "1"
+serde_json = "1"
 
 [dev-dependencies]
 assert_cmd = "2"

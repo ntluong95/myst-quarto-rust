@@ -2,7 +2,7 @@
 name = "mystquarto-core"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.88"
 description = "Typed IR, readers, writers, and diagnostics powering the mystquarto MyST <-> Quarto converter"
 license = "MIT-0"
 repository = "https://github.com/ntluong95/myst-quarto-rustCLI"
@@ -16,6 +16,8 @@ toml = "0.8.23"
 saphyr = "0.0.12"
 saphyr-parser = "0.0.12"
 thiserror = "2"
+ignore = "0.4"
+globset = "0.4"
 
 [dev-dependencies]
 similar = "2"

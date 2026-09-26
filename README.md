@@ -18,7 +18,7 @@ cargo install mystquarto
 Or without a local install:
 
 ```bash
-npx mystquarto to-quarto docs/
+npx mystquarto to-quarto docs/ -o /tmp/docs-quarto
 ```
 
 Or grab a prebuilt binary for macOS (arm64/x64), Linux (x64/arm64/musl), or
@@ -34,16 +34,23 @@ myst2quarto docs/ -o docs-quarto/
 quarto2myst docs/ -o docs-myst/
 
 # Unified CLI
-mystquarto to-quarto docs/
-mystquarto to-myst docs/
+mystquarto to-quarto docs/ -o docs-quarto/
+mystquarto to-myst docs/ -o docs-myst/
 ```
+
+`-o` is required. The output directory must not exist yet, or be empty, or
+hold this tool's own previous output of the same direction. It may sit inside
+the project only if it is gitignored (for example `_build/myst`). An existing
+project is always refused, even with `--force`: a conversion never merges
+into one, so you move the files you want by hand.
 
 ### Options
 
 | Flag | Description |
 |---|---|
-| `-o DIR` / `--output DIR` | Output directory (default: `<input>-quarto/` or `<input>-myst/`) |
-| `--in-place` | Modify files in-place (requires `--force`, refuses on a dirty VCS state) |
+| `-o DIR` / `--output DIR` | Output directory (required unless `--in-place`; see above) |
+| `--scope manuscript\|all` | `manuscript` (default) reads only what the project config reaches; `all` walks the whole folder (see below) |
+| `--in-place` | Modify files in-place (requires `--force`, refuses on a dirty VCS state, and in an agent-science-kit project) |
 | `--force` | Bypass the `--in-place` overwrite and clean-VCS-state gates |
 | `--config-only` | Only convert config files (`myst.yml` ↔ `_quarto.yml`) |
 | `--no-config` | Skip config file conversion |
@@ -56,6 +63,26 @@ silently dropped: unmappable constructs are preserved verbatim in
 `.mystquarto/preserved.json` and restored on the reverse conversion; label
 renames are tracked in `.mystquarto/labels.json` so `fig:samples` ↔
 `fig-samples` round-trips.
+
+### Which files are read
+
+With a project config (`_quarto.yml` / `myst.yml`), a conversion reads only
+the manuscript's **closure**. That means the files the config names
+(`manuscript.article`, `project.render`, `book.chapters`, `project.toc`,
+export articles, resources, bibliography), plus everything those files
+reach: includes, embeds, figures and images, links to other documents, and
+frontmatter bibliographies. Nothing else in the folder is read or copied.
+Without a config, the whole folder is walked, skipping agent and tooling
+files (`AGENTS.md`, `CLAUDE.md`, `README.md`, `CHANGELOG.md`, `plans/`).
+`--scope all` walks the whole folder even when a config exists.
+
+In every mode, `.gitignore` is honoured, and these locations are **never**
+read or copied, even when the manuscript references them:
+
+- the raw-data tier `data/raw/` and original literature `literature/og/`
+- `.ask/`, `.git/`, and `.env*` files
+
+A reference into one of them is error MQ0606 and fails the run.
 
 ## What it converts
 

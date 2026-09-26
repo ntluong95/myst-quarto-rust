@@ -5,6 +5,7 @@
 //! and project/page config mapping (`config`, `frontmatter`).
 #![forbid(unsafe_code)]
 
+pub mod closure;
 pub mod config;
 pub mod diagnostics;
 pub mod frontmatter;
