@@ -1,7 +1,7 @@
 ---
 phase: 7
 title: CLI surface and release
-status: pending
+status: in-progress
 repo: myst-quarto-rustCLI
 ---
 
@@ -20,3 +20,10 @@ repo: myst-quarto-rustCLI
 
 - CI is green on all targets, including the phase 1 renderer job.
 - `mystquarto --version`, `myst2quarto --version` and `quarto2myst --version` all print 0.3.0.
+
+## Result
+
+- Steps 1–4 are done. `--version` works on all three binaries (CLI test `every_binary_prints_its_version`). The version is 0.3.0. The CHANGELOG leads with the breaking changes. The README has the required `-o`, `--scope`, "Which files are read" (the denylist), and "Using with agent-science-kit" sections.
+- Step 2: `--no-label-map` was not actually inert. It already skips writing `labels.json`; only its doc comment said otherwise. The doc was fixed and the flag kept.
+- Step 6 (local): 0.3.0 installed into `~/.cargo/bin` from the branch, and the review's `/tmp/mq-*` scratch dirs deleted.
+- Step 5 (release through cargo-dist) is **pending the user's go-ahead**. It publishes a tag, GitHub release artifacts and the crates.io packages.

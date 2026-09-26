@@ -84,6 +84,28 @@ read or copied, even when the manuscript references them:
 
 A reference into one of them is error MQ0606 and fails the run.
 
+### Using with agent-science-kit
+
+In an [agent-science-kit](https://github.com/ntluong95/agent-science-kit)
+project, Quarto is the only source. A MyST version is a disposable preview
+built outside the project, so nothing is written into it:
+
+```bash
+tmp="$(mktemp -d)"
+mystquarto to-myst . -o "$tmp/myst"
+(cd "$tmp/myst" && myst start)
+```
+
+To bring an existing MyST project into an ASK project, convert it into a new
+directory and move the manuscript files across by hand:
+
+```bash
+mystquarto to-quarto path/to/myst-project -o "$(mktemp -d)/imported"
+```
+
+The full recipe, including a static HTML copy, is in ASK's
+`skills/ask-quarto-manuscript/references/render-and-troubleshoot.md`.
+
 ## What it converts
 
 ### Block directives

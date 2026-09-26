@@ -5,8 +5,7 @@
 //! plus this phase's `--force` (required by the `--in-place` safety
 //! contract — see `crate::orchestrate`). `--no-preserve` and
 //! `--format json` are deliberately **not** present: the phase spec drops
-//! both (they contradicted later-phase decisions). `--no-label-map` is
-//! present but inert this phase — see its field doc.
+//! both (they contradicted later-phase decisions).
 
 use std::path::PathBuf;
 
@@ -104,10 +103,8 @@ pub struct ConvertArgs {
     #[arg(long = "force")]
     pub force: bool,
 
-    /// Retained for CLI compatibility with the Python tool. The label-map
-    /// sidecar this flag would suppress does not exist until a later
-    /// phase's sidecar work; this phase accepts and stores the flag but
-    /// wires no behavior to it.
+    /// Do not write `.mystquarto/labels.json`, the label map a reverse
+    /// conversion uses to restore original MyST labels.
     #[arg(long = "no-label-map")]
     pub no_label_map: bool,
 }
@@ -116,6 +113,7 @@ pub struct ConvertArgs {
 #[derive(Parser, Debug)]
 #[command(
     name = "myst2quarto",
+    version,
     about = "Convert MyST markdown files to Quarto format"
 )]
 pub struct Myst2QuartoCli {
@@ -127,6 +125,7 @@ pub struct Myst2QuartoCli {
 #[derive(Parser, Debug)]
 #[command(
     name = "quarto2myst",
+    version,
     about = "Convert Quarto markdown files to MyST format"
 )]
 pub struct Quarto2MystCli {
@@ -139,7 +138,11 @@ pub struct Quarto2MystCli {
 /// Python `click.Group(invoke_without_command=True)` behavior:
 /// `mystquarto` alone is not an error).
 #[derive(Parser, Debug)]
-#[command(name = "mystquarto", about = "Bidirectional MyST <-> Quarto converter")]
+#[command(
+    name = "mystquarto",
+    version,
+    about = "Bidirectional MyST <-> Quarto converter"
+)]
 pub struct MystquartoCli {
     #[command(subcommand)]
     pub command: Option<MystquartoCommand>,

@@ -1408,3 +1408,16 @@ fn copy_dir(src: &Path, dst: &Path) {
         }
     }
 }
+
+#[test]
+fn every_binary_prints_its_version() {
+    let version = env!("CARGO_PKG_VERSION");
+    for bin in ["mystquarto", "myst2quarto", "quarto2myst"] {
+        Command::cargo_bin(bin)
+            .unwrap()
+            .arg("--version")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(format!("{bin} {version}")));
+    }
+}

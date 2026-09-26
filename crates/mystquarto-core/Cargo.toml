@@ -1,6 +1,6 @@
 [package]
 name = "mystquarto-core"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Typed IR, readers, writers, and diagnostics powering the mystquarto MyST <-> Quarto converter"
