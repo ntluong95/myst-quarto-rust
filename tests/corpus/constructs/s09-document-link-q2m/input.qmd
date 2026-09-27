@@ -1,0 +1,2 @@
+<!-- mystquarto-roundtrip: stable -->
+See [the methods](methods.qmd#sec-fit) and [the intro](intro.qmd).

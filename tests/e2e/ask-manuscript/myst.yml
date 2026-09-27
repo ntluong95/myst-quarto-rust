@@ -1,0 +1,27 @@
+# Legacy hand-authored MyST twin, as shipped by ASK before 0.3.0. A
+# to-myst run must ignore it and derive myst.yml from _quarto.yml.
+version: 1
+project:
+  title: "Probe Manuscript"
+  authors:
+    - name: "Jane Smith"
+      affiliations:
+        - "uni"
+      corresponding: true
+      email: jane@example.org
+  affiliations:
+    - id: "uni"
+      name: "Example University"
+  github: "https://example.org/probe-repo"
+  license:
+    content: CC-BY-4.0
+  date: "2026-09-26"
+  bibliography:
+    - literature/references.bib
+  exports:
+    - format: pdf
+      article: index.qmd
+      output: manuscript.pdf
+site:
+  title: "Probe Manuscript"
+  template: article-theme

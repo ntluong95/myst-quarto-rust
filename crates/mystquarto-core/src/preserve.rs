@@ -96,6 +96,32 @@ pub struct PreservedSidecar {
     pub fields: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub entries: BTreeMap<String, PreservedEntry>,
+    /// The source config this output was derived from, owned by
+    /// [`crate::config::snapshot`] — lets a reverse run restore it exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_config: Option<ConfigSnapshot>,
+    /// A target-dialect config found in the *input* and ignored (the input
+    /// already had, say, a stale `myst.yml` next to `_quarto.yml`), kept so
+    /// nothing the user wrote is lost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignored_config: Option<IgnoredConfig>,
+}
+
+/// A source config file and the config text this run derived from it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ConfigSnapshot {
+    /// The source config's file name (`_quarto.yml` / `myst.yml`).
+    pub name: String,
+    /// The source config's exact text.
+    pub source: String,
+    /// The target config text this run wrote.
+    pub derived: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct IgnoredConfig {
+    pub name: String,
+    pub text: String,
 }
 
 /// Computes the sidecar id for `original` — a short, stable, content-derived
@@ -174,11 +200,23 @@ fn write_sidecar(
     write_atomic(path, json.as_bytes())
 }
 
-/// Writes `entries` (this module's own section) to `path`, preserving
-/// whatever `fields` [`crate::config::sidecar`] already wrote there — see
-/// module docs. A read failure (missing/malformed/oversized file) is
-/// treated as "no existing `fields` to preserve," not an error, matching
-/// every other sidecar in this crate's untrusted-input handling.
+/// Rewrites the sidecar at `path` after `update` changes the section its
+/// caller owns, keeping every other section (entries, config fields, config
+/// snapshot) as it was. A read failure (missing/malformed/oversized file)
+/// counts as an empty sidecar, not an error, matching every other sidecar
+/// in this crate's untrusted-input handling.
+fn update_sidecar(
+    path: &Path,
+    update: impl FnOnce(&mut PreservedSidecar),
+) -> Result<(), crate::fs::atomic::AtomicWriteError> {
+    let mut sidecar = read(path).unwrap_or_default();
+    sidecar.version = 1;
+    update(&mut sidecar);
+    write_sidecar(&sidecar, path)
+}
+
+/// Writes `entries` (this module's own section) to `path` — see
+/// [`update_sidecar`].
 ///
 /// # Errors
 /// Propagates [`write_atomic`]'s error if the write fails.
@@ -186,20 +224,11 @@ pub fn write_entries(
     entries: &BTreeMap<String, PreservedEntry>,
     path: &Path,
 ) -> Result<(), crate::fs::atomic::AtomicWriteError> {
-    let fields = read(path).map(|s| s.fields).unwrap_or_default();
-    write_sidecar(
-        &PreservedSidecar {
-            version: 1,
-            fields,
-            entries: entries.clone(),
-        },
-        path,
-    )
+    update_sidecar(path, |s| s.entries = entries.clone())
 }
 
 /// Writes `fields` (§8.2's config-field section, owned by
-/// [`crate::config::sidecar`]) to `path`, preserving whatever `entries`
-/// this module already wrote there — see module docs.
+/// [`crate::config::sidecar`]) to `path` — see [`update_sidecar`].
 ///
 /// # Errors
 /// Propagates [`write_atomic`]'s error if the write fails.
@@ -207,15 +236,23 @@ pub fn write_fields(
     fields: &BTreeMap<String, serde_json::Value>,
     path: &Path,
 ) -> Result<(), crate::fs::atomic::AtomicWriteError> {
-    let entries = read(path).map(|s| s.entries).unwrap_or_default();
-    write_sidecar(
-        &PreservedSidecar {
-            version: 1,
-            fields: fields.clone(),
-            entries,
-        },
-        path,
-    )
+    update_sidecar(path, |s| s.fields = fields.clone())
+}
+
+/// Writes the config snapshot and ignored-config sections to `path`,
+/// replacing whatever a previous run recorded there — see [`update_sidecar`].
+///
+/// # Errors
+/// Propagates [`write_atomic`]'s error if the write fails.
+pub fn write_config_record(
+    snapshot: Option<ConfigSnapshot>,
+    ignored: Option<IgnoredConfig>,
+    path: &Path,
+) -> Result<(), crate::fs::atomic::AtomicWriteError> {
+    update_sidecar(path, |s| {
+        s.source_config = snapshot;
+        s.ignored_config = ignored;
+    })
 }
 
 #[cfg(test)]

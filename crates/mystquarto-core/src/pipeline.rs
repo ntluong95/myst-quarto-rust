@@ -138,6 +138,19 @@ pub fn convert_myst_to_quarto_batch(
     notebooks: &[PathBuf],
     input_root: &Path,
 ) -> MystToQuartoBatch {
+    convert_myst_to_quarto_batch_with(files, notebooks, input_root, false)
+}
+
+/// [`convert_myst_to_quarto_batch`] for a target project that does (a Quarto
+/// book) or does not (everything else) resolve `@id` references across
+/// documents. Where it cannot, a reference to a label another document
+/// defines becomes a link to that document's anchor.
+pub fn convert_myst_to_quarto_batch_with(
+    files: &[PathBuf],
+    notebooks: &[PathBuf],
+    input_root: &Path,
+    cross_document_refs: bool,
+) -> MystToQuartoBatch {
     let (notebook_index, mut warnings) = build_notebook_index(notebooks, input_root);
     let preservation_store = load_preservation_store(input_root);
 
@@ -156,7 +169,10 @@ pub fn convert_myst_to_quarto_batch(
     let (registry, registry_warnings) = LabelRegistry::build(&documents);
     warnings.extend(registry_warnings);
 
-    let writer = QuartoWriter::new(&registry);
+    let mut writer = QuartoWriter::new(&registry);
+    if !cross_document_refs {
+        writer = writer.with_document_links(link_targets(&registry, &documents));
+    }
     let mut rendered = BTreeMap::new();
     let mut preserved_entries = BTreeMap::new();
     for (path, doc) in &documents {
@@ -200,6 +216,41 @@ pub fn convert_myst_to_quarto_batch(
         preserved_entries,
         warnings,
     }
+}
+
+/// Every Quarto id with the document that defines it and the text a link to
+/// it should show: a section's heading, else the id itself.
+fn link_targets(
+    registry: &LabelRegistry,
+    documents: &[(PathBuf, Document)],
+) -> BTreeMap<String, (PathBuf, String)> {
+    let mut out: BTreeMap<String, (PathBuf, String)> = registry
+        .entries()
+        .map(|(source, _, id)| (id.to_string(), (source.to_path_buf(), id.to_string())))
+        .collect();
+    fn headings(
+        blocks: &[crate::Block],
+        source: &Path,
+        registry: &LabelRegistry,
+        out: &mut BTreeMap<String, (PathBuf, String)>,
+    ) {
+        for block in blocks {
+            if let BlockKind::Heading {
+                text,
+                label: Some(label),
+                ..
+            } = &block.kind
+            {
+                if let Some(id) = registry.quarto_id(source, label) {
+                    out.insert(id.to_string(), (source.to_path_buf(), text.clone()));
+                }
+            }
+        }
+    }
+    for (source, doc) in documents {
+        headings(&doc.blocks, source, registry, &mut out);
+    }
+    out
 }
 
 /// Loads `.mystquarto/preserved.json` under `input_root` (RT-11: the reader
@@ -413,6 +464,10 @@ fn collect_defined_labels(blocks: &[Block], out: &mut Vec<String>) {
             | BlockKind::Blockquote { body, .. }
             | BlockKind::Theorem { body, .. }
             | BlockKind::Directive { body, .. } => collect_defined_labels(body, out),
+            BlockKind::Figure {
+                src: FigureSource::Panel(subfigures),
+                ..
+            } => collect_defined_labels(subfigures, out),
             BlockKind::TabSet { items } => {
                 for item in items {
                     collect_defined_labels(&item.body, out);
@@ -708,13 +763,43 @@ mod tests {
         cleanup(&tmp);
     }
 
+    /// `true` when every line containing `needle` sits inside the visible
+    /// copy of a preserved construct: a code fence marked
+    /// `mystquarto-preserved`, closed only by a line of exactly its own
+    /// backticks. A content line able to close the fence early would leave
+    /// the rest of the content outside it, and this returns `false`.
+    fn only_inside_visible_copies(text: &str, needle: &str) -> bool {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut inside = vec![false; lines.len()];
+        let mut i = 0;
+        while i < lines.len() {
+            let open = lines[i].trim_start();
+            if open.starts_with("```") && open.contains(crate::writer::PRESERVED_CLASS) {
+                let fence = "`".repeat(open.chars().take_while(|c| *c == '`').count());
+                let mut j = i + 1;
+                while j < lines.len() && lines[j].trim() != fence {
+                    inside[j] = true;
+                    j += 1;
+                }
+                i = j + 1;
+                continue;
+            }
+            i += 1;
+        }
+        lines
+            .iter()
+            .enumerate()
+            .all(|(k, l)| !l.contains(needle) || inside[k])
+    }
+
     #[test]
     fn preserved_content_round_trips_through_the_preservation_sidecar() {
         // RT-11, end to end: an unmappable MyST construct converted forward
-        // leaves only a single-line marker in the `.qmd` (never the
-        // original source — RT-02) plus a sidecar entry; converting that
-        // `.qmd` back (from an input root where the sidecar is
-        // discoverable) restores the exact original construct.
+        // leaves a single-line marker plus a visible, literal copy of the
+        // original in the `.qmd` (so the content still shows when rendered)
+        // and a sidecar entry; converting that `.qmd` back (from an input
+        // root where the sidecar is discoverable) restores the exact
+        // original construct.
         let tmp = tempdir("preserve-round-trip");
         write(
             &tmp.join("a.md"),
@@ -733,13 +818,11 @@ mod tests {
             qmd_text.contains("<!-- mystquarto MQ0201:"),
             "expected a preservation marker; got:\n{qmd_text}"
         );
-        // The marker's `kind` label legitimately says "glossary" (extracted
-        // from the reader's reason text) — RT-02 is about the *original
-        // body content* (here, "term"/"definition") never appearing
-        // in-document, and the marker being a single line.
+        // RT-02: the original body may appear only as literal code inside
+        // the visible copy's fence, never as live document content.
         assert!(
-            !qmd_text.contains("term") && !qmd_text.contains("definition"),
-            "original source must never appear inline in the document (RT-02); got:\n{qmd_text}"
+            qmd_text.contains("definition") && only_inside_visible_copies(qmd_text, "definition"),
+            "original source must appear only inside the visible copy (RT-02); got:\n{qmd_text}"
         );
         assert_eq!(
             qmd_text
@@ -791,8 +874,9 @@ mod tests {
         assert!(forward.errors.is_empty(), "{:?}", forward.errors);
         let qmd_text = &forward.rendered[&tmp.join("a.md")];
         assert!(
-            !qmd_text.contains("onclick") && !qmd_text.contains("LIVE HTML"),
-            "the dangerous body must never reach the document; got:\n{qmd_text}"
+            only_inside_visible_copies(qmd_text, "onclick")
+                && only_inside_visible_copies(qmd_text, "LIVE HTML"),
+            "the dangerous body must never reach the document as live content; got:\n{qmd_text}"
         );
 
         let hop2 = tempdir("c2-hop2");
@@ -813,6 +897,37 @@ mod tests {
 
         cleanup(&tmp);
         cleanup(&hop2);
+    }
+
+    #[test]
+    fn without_a_sidecar_the_visible_copy_restores_the_construct() {
+        let original = "# H\n\n:::{glossary}\nterm\n: definition\n:::\n";
+        let tmp = tempdir("visible-fallback");
+        write(&tmp.join("a.md"), original);
+        let forward = convert_myst_to_quarto_batch(&[tmp.join("a.md")], &[], &tmp);
+        let out = tempdir("visible-fallback-out");
+        write(&out.join("a.qmd"), &forward.rendered[&tmp.join("a.md")]);
+        // No sidecar written: the reverse run only has the document.
+        let reverse = convert_quarto_to_myst_batch(&[out.join("a.qmd")], &[], &out, None);
+        assert_eq!(reverse.rendered[&out.join("a.qmd")], original);
+        cleanup(&tmp);
+        cleanup(&out);
+    }
+
+    #[test]
+    fn content_with_long_backtick_fences_cannot_close_its_visible_copy_early() {
+        let tmp = tempdir("fence-breakout");
+        write(
+            &tmp.join("a.md"),
+            ":::{glossary}\n````\n<script>alert(1)</script>\n``````\n<script>alert(2)</script>\n:::\n",
+        );
+        let batch = convert_myst_to_quarto_batch(&[tmp.join("a.md")], &[], &tmp);
+        let qmd_text = &batch.rendered[&tmp.join("a.md")];
+        assert!(
+            only_inside_visible_copies(qmd_text, "<script>"),
+            "got:\n{qmd_text}"
+        );
+        cleanup(&tmp);
     }
 
     #[test]
@@ -867,10 +982,10 @@ mod tests {
         // unmappable source in an HTML comment, which Pandoc/Quarto ends at
         // the first *blank line* (not at `-->`), so multi-paragraph
         // unmappable content containing `<script>` after a blank line
-        // became live, rendered markup. The marker+sidecar mechanism this
-        // phase adds structurally cannot reproduce that: the document only
-        // ever holds a single-line, content-free marker — the original
-        // (however dangerous-looking) never appears in the document at all.
+        // became live, rendered markup. Now the marker is a single-line,
+        // content-free comment, and the visible copy is a code fence longer
+        // than any backtick run in the content, so however dangerous the
+        // original looks it renders only as literal code.
         let tmp = tempdir("injection-regression");
         write(
             &tmp.join("a.md"),
@@ -882,12 +997,12 @@ mod tests {
 
         let qmd_text = &batch.rendered[&tmp.join("a.md")];
         assert!(
-            !qmd_text.contains("<script>"),
-            "the dangerous content must never reach the document; got:\n{qmd_text}"
+            only_inside_visible_copies(qmd_text, "<script>"),
+            "the dangerous content must never reach the document as live markup; got:\n{qmd_text}"
         );
         assert!(
-            !qmd_text.contains("--!>"),
-            "the embedded comment-terminator lookalike must never reach the document; got:\n{qmd_text}"
+            only_inside_visible_copies(qmd_text, "--!>"),
+            "the comment-terminator lookalike must stay inside the literal copy; got:\n{qmd_text}"
         );
         // Exactly one marker line, no blank line inside it for a
         // downstream HTML-comment-termination rule to exploit.

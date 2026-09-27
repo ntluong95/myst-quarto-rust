@@ -1,1 +1,1 @@
-See [chapters/methods](chapters/methods.qmd) for more.
+See [chapters/methods](chapters/methods.md) for more.

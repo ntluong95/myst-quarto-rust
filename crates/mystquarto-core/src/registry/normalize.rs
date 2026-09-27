@@ -129,7 +129,7 @@ pub fn normalize(raw: &str, kind: RefKind) -> String {
         None => (raw.to_string(), false),
     };
 
-    let with_inferred_prefix = if colon_present {
+    let with_inferred_prefix = if colon_present || already_quarto_prefixed(&base, &kind) {
         base
     } else {
         match inferred_prefix_key(kind).and_then(label_prefix_quarto) {
@@ -139,6 +139,21 @@ pub fn normalize(raw: &str, kind: RefKind) -> String {
     };
 
     sanitize(&with_inferred_prefix)
+}
+
+/// `true` when an unprefixed label already carries the Quarto prefix its
+/// kind would inject (`fig-main` on a figure), so rule 3 must not prefix it
+/// a second time (`fig-fig-main`). Authors who already write Quarto-style
+/// hyphen labels in MyST hit this constantly. A code cell may legitimately
+/// produce a figure or a table, so either prefix counts there. The match
+/// needs the hyphen: `figure-x` is not `fig-` prefixed.
+fn already_quarto_prefixed(base: &str, kind: &RefKind) -> bool {
+    let lower = base.to_ascii_lowercase();
+    let has = |key: &str| label_prefix_quarto(key).is_some_and(|p| lower.starts_with(p));
+    match kind {
+        RefKind::CodeCell => has("fig:") || has("tab:"),
+        other => inferred_prefix_key(other.clone()).is_some_and(has),
+    }
 }
 
 /// Looks up a `[[label_prefix]]` row by its MyST-side key (e.g. `"fig:"`,
@@ -252,6 +267,37 @@ mod tests {
             ),
             "alg-main"
         );
+    }
+
+    #[test]
+    fn already_prefixed_hyphen_labels_are_not_prefixed_again() {
+        assert_eq!(normalize("fig-main", RefKind::Figure), "fig-main");
+        assert_eq!(normalize("sec-intro", RefKind::Section), "sec-intro");
+        assert_eq!(normalize("eq-model", RefKind::Equation), "eq-model");
+        assert_eq!(normalize("tbl-demo", RefKind::Table), "tbl-demo");
+        assert_eq!(normalize("Fig-Main", RefKind::Figure), "fig-main");
+        assert_eq!(
+            normalize(
+                "thm-main",
+                RefKind::Theorem {
+                    subtype: "theorem".into()
+                }
+            ),
+            "thm-main"
+        );
+    }
+
+    #[test]
+    fn prefix_match_needs_the_hyphen() {
+        assert_eq!(normalize("main", RefKind::Figure), "fig-main");
+        assert_eq!(normalize("figure-x", RefKind::Figure), "fig-figure-x");
+    }
+
+    #[test]
+    fn code_cell_keeps_either_a_figure_or_a_table_prefix() {
+        assert_eq!(normalize("fig-py", RefKind::CodeCell), "fig-py");
+        assert_eq!(normalize("tbl-py", RefKind::CodeCell), "tbl-py");
+        assert_eq!(normalize("py", RefKind::CodeCell), "fig-py");
     }
 
     #[test]

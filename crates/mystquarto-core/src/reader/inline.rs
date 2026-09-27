@@ -6,9 +6,31 @@ use crate::reader::mask::mask_code_spans;
 pub enum InlineEvent {
     Citation(String),
     CrossReference(String),
-    LegacyRole { role: String, target: String },
-    JupyterEval { engine: String, expr: String },
+    LegacyRole {
+        role: String,
+        target: String,
+    },
+    JupyterEval {
+        engine: String,
+        expr: String,
+    },
     KnitrEval(String),
+    /// `[](#label)`: MyST's empty link to a labelled target.
+    AnchorReference(String),
+    /// `[text](other.md#frag)`: a relative link to another document
+    /// (`.md` or `.qmd`), which the target dialect renames.
+    DocumentLink {
+        text: String,
+        path: String,
+        fragment: String,
+    },
+    /// Pandoc inline markup with a MyST role equivalent: `~x~` (`sub`),
+    /// `^x^` (`sup`), `[x]{.kbd}` (`kbd`), `<abbr title="e">t</abbr>`
+    /// (`abbr`, content `t (e)`).
+    PandocInline {
+        role: &'static str,
+        content: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -33,6 +55,7 @@ pub fn scan_line(line: &str, known_labels: &[String]) -> InlineScan {
         } else if let Some((len, event)) = read_legacy_role(rest)
             .or_else(|| read_braced_eval(rest))
             .or_else(|| read_knitr_eval(rest))
+            .or_else(|| read_markup(rest))
             .or_else(|| read_at_reference(rest, known_labels))
         {
             events.push(event);
@@ -78,6 +101,124 @@ fn read_knitr_eval(rest: &str) -> Option<(usize, InlineEvent)> {
     let tail = rest.strip_prefix("`r ")?;
     let end = tail.find('`')?;
     Some((end + 4, InlineEvent::KnitrEval(tail[..end].to_string())))
+}
+
+/// Links and Pandoc inline markup that one dialect spells differently.
+fn read_markup(rest: &str) -> Option<(usize, InlineEvent)> {
+    read_link(rest)
+        .or_else(|| read_kbd(rest))
+        .or_else(|| read_abbr(rest))
+        .or_else(|| read_delimited(rest, '~', "sub"))
+        .or_else(|| read_delimited(rest, '^', "sup"))
+}
+
+/// `[](#label)`, or `[text](path.md|.qmd#frag)` with a relative path.
+fn read_link(rest: &str) -> Option<(usize, InlineEvent)> {
+    let tail = rest.strip_prefix('[')?;
+    if tail.starts_with('@') || tail.starts_with("-@") || tail.starts_with('^') {
+        return None;
+    }
+    let text_end = tail.find("](")?;
+    let text = &tail[..text_end];
+    if text.contains('[') || text.contains(']') {
+        return None;
+    }
+    let after = &tail[text_end + 2..];
+    let target_end = after.find(')')?;
+    let target = &after[..target_end];
+    let len = 1 + text_end + 2 + target_end + 1;
+    if let Some(label) = target.strip_prefix('#') {
+        return (text.is_empty() && !label.is_empty() && !label.contains(char::is_whitespace))
+            .then(|| (len, InlineEvent::AnchorReference(label.to_string())));
+    }
+    if target.contains("://") || target.contains(char::is_whitespace) || target.starts_with('/') {
+        return None;
+    }
+    let (path, fragment) = match target.split_once('#') {
+        Some((p, f)) => (p, format!("#{f}")),
+        None => (target, String::new()),
+    };
+    (path.ends_with(".md") || path.ends_with(".qmd")).then(|| {
+        (
+            len,
+            InlineEvent::DocumentLink {
+                text: text.to_string(),
+                path: path.to_string(),
+                fragment,
+            },
+        )
+    })
+}
+
+/// `[x]{.kbd}`.
+fn read_kbd(rest: &str) -> Option<(usize, InlineEvent)> {
+    let tail = rest.strip_prefix('[')?;
+    let end = tail.find("]{.kbd}")?;
+    let content = &tail[..end];
+    (!content.is_empty() && !content.contains(['[', ']'])).then(|| {
+        (
+            1 + end + "]{.kbd}".len(),
+            InlineEvent::PandocInline {
+                role: "kbd",
+                content: content.to_string(),
+            },
+        )
+    })
+}
+
+/// `<abbr title="expansion">term</abbr>`.
+fn read_abbr(rest: &str) -> Option<(usize, InlineEvent)> {
+    let tail = rest.strip_prefix("<abbr")?;
+    let tag_end = tail.find('>')?;
+    let attrs = &tail[..tag_end];
+    let body = &tail[tag_end + 1..];
+    let close = body.find("</abbr>")?;
+    let term = &body[..close];
+    let title = attrs
+        .split_once("title=\"")
+        .and_then(|(_, t)| t.split_once('"'))
+        .map(|(t, _)| t);
+    let content = match title {
+        Some(t) => format!("{} ({})", unescape_html(term), unescape_html(t)),
+        None => unescape_html(term),
+    };
+    Some((
+        "<abbr".len() + tag_end + 1 + close + "</abbr>".len(),
+        InlineEvent::PandocInline {
+            role: "abbr",
+            content,
+        },
+    ))
+}
+
+fn unescape_html(s: &str) -> String {
+    s.replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// Pandoc's `~sub~` / `^sup^`: no spaces inside, not doubled (`~~strike~~`).
+fn read_delimited(rest: &str, delim: char, role: &'static str) -> Option<(usize, InlineEvent)> {
+    let tail = rest.strip_prefix(delim)?;
+    if tail.starts_with(delim) {
+        return None;
+    }
+    let end = tail.find(delim)?;
+    let content = &tail[..end];
+    let valid = !content.is_empty()
+        && !content.contains(char::is_whitespace)
+        && !content.contains(['[', ']'])
+        && !tail[end + delim.len_utf8()..].starts_with(delim);
+    valid.then(|| {
+        (
+            2 * delim.len_utf8() + end,
+            InlineEvent::PandocInline {
+                role,
+                content: content.to_string(),
+            },
+        )
+    })
 }
 
 fn read_bracket_citation(rest: &str) -> Option<(usize, Vec<InlineEvent>)> {
@@ -191,6 +332,7 @@ pub fn rewrite_line(
         if let Some((len, event)) = read_legacy_role(rest)
             .or_else(|| read_braced_eval(rest))
             .or_else(|| read_knitr_eval(rest))
+            .or_else(|| read_markup(rest))
         {
             out.push_str(&render(event).unwrap_or_else(|| rest[..len].to_string()));
             i += len;
@@ -311,6 +453,48 @@ mod tests {
             },
         );
         assert_eq!(out, "See [[fig-samples]] and @numpy.");
+    }
+
+    #[test]
+    fn links_and_pandoc_markup_are_recognized() {
+        let scan = scan_line(
+            "See [](#tbl-demo), [chapter](chapter.qmd#s), H~2~O, x^2^, [Ctrl]{.kbd}, \
+             <abbr title=\"confidence interval\">CI</abbr>, ~~gone~~, [site](https://x.org/a.md).",
+            &[],
+        );
+        assert_eq!(
+            scan.events,
+            vec![
+                InlineEvent::AnchorReference("tbl-demo".to_string()),
+                InlineEvent::DocumentLink {
+                    text: "chapter".to_string(),
+                    path: "chapter.qmd".to_string(),
+                    fragment: "#s".to_string()
+                },
+                InlineEvent::PandocInline {
+                    role: "sub",
+                    content: "2".to_string()
+                },
+                InlineEvent::PandocInline {
+                    role: "sup",
+                    content: "2".to_string()
+                },
+                InlineEvent::PandocInline {
+                    role: "kbd",
+                    content: "Ctrl".to_string()
+                },
+                InlineEvent::PandocInline {
+                    role: "abbr",
+                    content: "CI (confidence interval)".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn footnotes_and_tildes_in_prose_are_not_markup() {
+        let scan = scan_line("A note[^1] and ~ 5 km and a~b c~d.", &[]);
+        assert!(scan.events.is_empty(), "{:?}", scan.events);
     }
 
     #[test]

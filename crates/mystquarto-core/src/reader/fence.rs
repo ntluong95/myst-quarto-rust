@@ -161,6 +161,51 @@ pub fn take_myst_directive(lines: &[&str], start: usize, line_no: u32) -> Option
     })
 }
 
+/// Takes a Pandoc fenced div's body. Pandoc divs nest by position, not by
+/// fence length: any `:::` line with content after the colons opens a div,
+/// and a bare colon line closes the innermost open one. Fenced code inside
+/// the div is skipped whole, so a `:::` line in a code sample is never read
+/// as a fence. Returns `(body, original, end_index)`.
+#[must_use]
+pub fn take_quarto_div_body(lines: &[&str], start: usize) -> (Vec<String>, Vec<String>, usize) {
+    let mut body = Vec::new();
+    let mut original = vec![lines[start].to_string()];
+    let mut depth = 1usize;
+    let mut i = start + 1;
+    while i < lines.len() {
+        let line = lines[i];
+        if let Some((fence_char, count, indent, _)) = parse_regular_code_open(line)
+            .or_else(|| parse_quarto_code_open(line).map(|o| ('`', o.fence_count, o.indent, None)))
+        {
+            let (code, code_original, end) = take_fenced_body(lines, i, fence_char, count, indent);
+            body.push(line.to_string());
+            body.extend(code);
+            if end > i && end < lines.len() && code_original.len() > 1 {
+                body.push(lines[end].to_string());
+            }
+            original.extend(code_original);
+            i = end + 1;
+            continue;
+        }
+        original.push(line.to_string());
+        let trimmed = line.trim();
+        let colons = trimmed.chars().take_while(|c| *c == ':').count();
+        if colons >= 3 {
+            if trimmed.len() == colons {
+                depth -= 1;
+                if depth == 0 {
+                    return (body, original, i);
+                }
+            } else {
+                depth += 1;
+            }
+        }
+        body.push(line.to_string());
+        i += 1;
+    }
+    (body, original, lines.len().saturating_sub(1))
+}
+
 #[must_use]
 pub fn take_fenced_body(
     lines: &[&str],
@@ -243,6 +288,25 @@ mod tests {
             Some("fig:x")
         );
         assert_eq!(frame.body, vec!["Caption".to_string()]);
+    }
+
+    #[test]
+    fn quarto_divs_nest_by_position_and_skip_fenced_code() {
+        let lines = [
+            "::: {.grid}",
+            "::: {.g-col-6}",
+            "A",
+            ":::",
+            "```python",
+            ":::",
+            "```",
+            ":::",
+            "after",
+        ];
+        let (body, _, end) = take_quarto_div_body(&lines, 0);
+        assert_eq!(end, 7);
+        assert_eq!(body.len(), 6, "{body:?}");
+        assert_eq!(body[3], "```python");
     }
 
     #[test]

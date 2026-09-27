@@ -24,6 +24,7 @@ pub mod myst_to_quarto;
 pub mod project_type;
 pub mod quarto_to_myst;
 pub mod sidecar;
+pub mod snapshot;
 
 pub use project_type::ProjectType;
 

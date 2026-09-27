@@ -55,9 +55,16 @@ impl QuartoReader {
             }
             if let Some(id) = preservation_marker_id(line) {
                 flush_paragraph(&mut out, &mut para, para_start, line_no, para_blank);
-                self.push_preserved_or_marker(&mut out, id, line_no, blank)?;
+                let visible = crate::reader::visible_preserved_block(lines, i + 1);
+                self.push_preserved_or_marker(
+                    &mut out,
+                    id,
+                    line_no,
+                    blank,
+                    visible.as_ref().map(|(body, _)| body.as_slice()),
+                )?;
                 blank = 0;
-                i += 1;
+                i = visible.map_or(i + 1, |(_, end)| end + 1);
                 continue;
             }
             if let Some(kind) = self.shortcode(line) {
@@ -71,6 +78,20 @@ impl QuartoReader {
                 flush_paragraph(&mut out, &mut para, para_start, line_no, para_blank);
                 let (body, _, end) =
                     fence::take_fenced_body(lines, i, '`', open.fence_count, open.indent);
+                // ```{.python attr=..} is a static, attributed code block,
+                // and ```{mermaid} a diagram: neither is an executable cell.
+                if open.lang.starts_with('.') || open.lang == "mermaid" {
+                    let (lang, attrs) = static_code_open(&open.lang);
+                    out.push(block(
+                        BlockKind::StaticCode { lang, body, attrs },
+                        line_no,
+                        start_line + end as u32,
+                        blank,
+                    ));
+                    blank = 0;
+                    i = end + 1;
+                    continue;
+                }
                 if let Some(format) = open.lang.strip_prefix('=') {
                     out.push(block(
                         BlockKind::Raw {
@@ -124,8 +145,7 @@ impl QuartoReader {
             }
             if let Some(open) = fence::parse_quarto_div_open(line) {
                 flush_paragraph(&mut out, &mut para, para_start, line_no, para_blank);
-                let (body, original, end) =
-                    fence::take_fenced_body(lines, i, ':', open.fence_count, open.indent);
+                let (body, original, end) = fence::take_quarto_div_body(lines, i);
                 let kind = self.div_to_block(&open.attrs, &body, &original, line_no + 1)?;
                 out.push(block(kind, line_no, start_line + end as u32, blank));
                 blank = 0;
@@ -147,7 +167,7 @@ impl QuartoReader {
                 i = end + 1;
                 continue;
             }
-            if line.trim_start().starts_with('|') {
+            if line.trim_start().starts_with('|') || line.trim_start().starts_with("+-") {
                 flush_paragraph(&mut out, &mut para, para_start, line_no, para_blank);
                 let (kind, end) = parse_table(lines, i);
                 out.push(block(kind, line_no, start_line + end as u32, blank));
@@ -175,15 +195,16 @@ impl QuartoReader {
                     .trim_end_matches("-->")
                     .trim()
                     .to_string();
-                out.push(block(
+                // The MyST->Quarto direction's stand-in for `+++`.
+                let kind = if text == crate::ir::BLOCK_BREAK_COMMENT {
+                    BlockKind::BlockBreak
+                } else {
                     BlockKind::Comment {
                         text,
                         style: CommentStyle::Html,
-                    },
-                    line_no,
-                    line_no,
-                    blank,
-                ));
+                    }
+                };
+                out.push(block(kind, line_no, line_no, blank));
                 blank = 0;
                 i += 1;
                 continue;
@@ -214,12 +235,27 @@ impl QuartoReader {
         body_start: u32,
     ) -> Result<BlockKind, ReaderError> {
         let parsed_attrs = parse_attrs(attrs);
-        if let Some(kind) = callout_kind(attrs) {
+        let classes: Vec<&str> = parsed_attrs
+            .get("class")
+            .map(|c| c.split(' ').collect())
+            .unwrap_or_default();
+        if let Some(kind) = callout_kind(&classes) {
             return Ok(BlockKind::Admonition {
                 kind,
                 title: parsed_attrs.get("title").cloned(),
                 body: self.parse_owned_body(body, body_start)?,
                 collapse: parsed_attrs.get("collapse").map(|v| v == "true"),
+            });
+        }
+        if let Some(class) = classes
+            .iter()
+            .find(|c| matches!(**c, "epigraph" | "pull-quote" | "blockquote"))
+        {
+            let (quote, attribution) = split_quote(body);
+            return Ok(BlockKind::Blockquote {
+                body: self.parse_owned_body(&quote, body_start)?,
+                attribution,
+                class: Some((*class).to_string()),
             });
         }
         if attrs.contains(".panel-tabset") {
@@ -240,18 +276,55 @@ impl QuartoReader {
             });
         }
         if parsed_attrs.contains_key("id") {
-            return Ok(BlockKind::Figure {
-                src: FigureSource::Path(PathBuf::new()),
-                caption: body.to_vec(),
-                label: parsed_attrs.get("id").map(Label::new),
-                attrs: parsed_attrs,
+            if let Some(kind) = self.figure_div(&parsed_attrs, body, body_start)? {
+                return Ok(kind);
+            }
+        }
+        if classes.contains(&"grid") {
+            let mut items = self.parse_owned_body(body, body_start)?;
+            let mut columns = None;
+            for item in &mut items {
+                if let BlockKind::Directive { attrs, .. } = &mut item.kind {
+                    if let Some(span) = attrs.remove(GRID_SPAN) {
+                        columns =
+                            columns.or_else(|| span.parse::<usize>().ok().map(|s| 12 / s.max(1)));
+                    }
+                }
+            }
+            let mut attrs = Attrs::new();
+            if let Some(n) = columns {
+                attrs.insert(crate::reader::myst::ARGUMENT.to_string(), n.to_string());
+            }
+            return Ok(BlockKind::Directive {
+                name: "grid".to_string(),
+                attrs,
+                body: items,
+                label: None,
             });
         }
-        if attrs.contains(".grid") || attrs.contains(".card") {
+        let is_card = classes.contains(&"card");
+        let span = classes.iter().find_map(|c| c.strip_prefix("g-col-md-"));
+        if is_card || span.is_some() {
+            let mut attrs = Attrs::new();
+            if let Some(span) = span {
+                attrs.insert(GRID_SPAN.to_string(), span.to_string());
+            }
+            let mut lines = body.to_vec();
+            let first = lines.iter().position(|l| !l.trim().is_empty());
+            if let Some(i) = first {
+                let t = lines[i].trim();
+                if is_card && t.len() > 4 && t.starts_with("**") && t.ends_with("**") {
+                    attrs.insert(
+                        crate::reader::myst::ARGUMENT.to_string(),
+                        t[2..t.len() - 2].to_string(),
+                    );
+                    lines.remove(i);
+                }
+            }
             return Ok(BlockKind::Directive {
-                name: attrs.trim_start_matches('.').to_string(),
-                attrs: parsed_attrs,
-                body: self.parse_owned_body(body, body_start)?,
+                name: if is_card { "card" } else { "grid-item" }.to_string(),
+                attrs,
+                body: self.parse_owned_body(&lines, body_start)?,
                 label: None,
             });
         }
@@ -259,6 +332,65 @@ impl QuartoReader {
             original: original.to_vec(),
             reason: format!("unrecognized Quarto div {{{attrs}}}"),
         })
+    }
+
+    /// A div with an id around images: a panel of subfigures, or (one
+    /// unlabelled image) a figure with a multi-paragraph caption. Paragraphs
+    /// after the images are the caption. A div with no image is not a
+    /// figure at all.
+    fn figure_div(
+        &self,
+        attrs: &Attrs,
+        body: &[String],
+        body_start: u32,
+    ) -> Result<Option<BlockKind>, ReaderError> {
+        let blocks = self.parse_owned_body(body, body_start)?;
+        let (figures, rest): (Vec<Block>, Vec<Block>) = blocks
+            .into_iter()
+            .partition(|b| matches!(b.kind, BlockKind::Figure { .. }));
+        if figures.is_empty() {
+            return Ok(None);
+        }
+        let mut caption = Vec::new();
+        for b in &rest {
+            if let BlockKind::Paragraph { lines } = &b.kind {
+                if !caption.is_empty() {
+                    caption.push(String::new());
+                }
+                caption.extend(lines.iter().cloned());
+            }
+        }
+        let label = attrs.get("id").map(Label::new);
+        let mut panel_attrs: Attrs = attrs
+            .iter()
+            .filter(|(k, _)| k.as_str() != "id")
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if let [only] = figures.as_slice() {
+            if let BlockKind::Figure {
+                src: src @ FigureSource::Path(_),
+                label: None,
+                caption: inner,
+                attrs: inner_attrs,
+            } = &only.kind
+            {
+                if inner.is_empty() && panel_attrs.is_empty() {
+                    panel_attrs.extend(inner_attrs.clone());
+                    return Ok(Some(BlockKind::Figure {
+                        src: src.clone(),
+                        caption,
+                        label,
+                        attrs: panel_attrs,
+                    }));
+                }
+            }
+        }
+        Ok(Some(BlockKind::Figure {
+            src: FigureSource::Panel(figures),
+            caption,
+            label,
+            attrs: panel_attrs,
+        }))
     }
 
     fn parse_owned_body(&self, lines: &[String], start: u32) -> Result<Vec<Block>, ReaderError> {
@@ -344,6 +476,7 @@ impl QuartoReader {
         id: &str,
         line: u32,
         blank: u8,
+        visible: Option<&[String]>,
     ) -> Result<(), ReaderError> {
         use crate::preserve::Dialect;
 
@@ -372,6 +505,18 @@ impl QuartoReader {
                 BlockKind::Preserved {
                     original: original.clone(),
                     code: "preserved-foreign-dialect",
+                },
+                line,
+                line,
+                blank,
+            ));
+        } else if let Some(visible) = visible.filter(|v| !v.is_empty()) {
+            // No sidecar entry, but the visible copy right after the marker
+            // holds the original, in the other dialect: pass it through.
+            out.push(block(
+                BlockKind::Preserved {
+                    original: visible.to_vec(),
+                    code: "preserved-visible-copy",
                 },
                 line,
                 line,
@@ -455,7 +600,7 @@ fn parse_math(lines: &[&str], start: usize) -> (BlockKind, usize) {
 fn parse_table(lines: &[&str], start: usize) -> (BlockKind, usize) {
     let mut rows = Vec::new();
     let mut i = start;
-    while i < lines.len() && lines[i].trim_start().starts_with('|') {
+    while i < lines.len() && lines[i].trim_start().starts_with(['|', '+']) {
         rows.push(lines[i].to_string());
         i += 1;
     }
@@ -504,34 +649,136 @@ fn parse_heading(line: &str) -> Option<(u8, String, Option<Label>)> {
     Some((level as u8, text, label.map(Label::new)))
 }
 
-fn parse_attrs(attrs: &str) -> Attrs {
+/// A grid item's `g-col-md-N` span, read by the enclosing grid to recover
+/// MyST's column count.
+const GRID_SPAN: &str = "g-col-md";
+
+/// Parses a Pandoc attribute list (`#id .class key=value key="quoted value"`).
+/// Classes are kept together, space-separated, under `class`, in order.
+pub(crate) fn parse_attrs(attrs: &str) -> Attrs {
     let mut out = BTreeMap::new();
-    for part in attrs.split_whitespace() {
+    let mut classes: Vec<String> = Vec::new();
+    for part in attr_tokens(attrs) {
         if let Some(id) = part.strip_prefix('#') {
             out.insert("id".to_string(), id.to_string());
         } else if let Some(class) = part.strip_prefix('.') {
-            out.insert("class".to_string(), class.to_string());
+            classes.push(class.to_string());
         } else if let Some((key, value)) = part.split_once('=') {
-            out.insert(key.to_string(), unquote(value));
+            out.insert(key.to_string(), unquote_attr(value));
         }
+    }
+    if !classes.is_empty() {
+        out.insert("class".to_string(), classes.join(" "));
     }
     out
 }
 
-fn callout_kind(attrs: &str) -> Option<AdmonitionKind> {
-    if attrs.contains(".callout-note") {
-        Some(AdmonitionKind::Note)
-    } else if attrs.contains(".callout-warning") {
-        Some(AdmonitionKind::Warning)
-    } else if attrs.contains(".callout-tip") {
-        Some(AdmonitionKind::Tip)
-    } else if attrs.contains(".callout-important") {
-        Some(AdmonitionKind::Important)
-    } else if attrs.contains(".callout-caution") {
-        Some(AdmonitionKind::Caution)
-    } else {
-        None
+/// Splits an attribute list on whitespace outside double quotes.
+fn attr_tokens(attrs: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    for c in attrs.chars() {
+        if escaped {
+            current.push(c);
+            escaped = false;
+        } else if c == '\\' && quoted {
+            current.push(c);
+            escaped = true;
+        } else if c == '"' {
+            quoted = !quoted;
+            current.push(c);
+        } else if c.is_whitespace() && !quoted {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(c);
+        }
     }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// An attribute value without its quotes, with `\"` and `\\` unescaped.
+fn unquote_attr(value: &str) -> String {
+    let v = value.trim();
+    match v.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        Some(inner) => inner.replace("\\\"", "\"").replace("\\\\", "\\"),
+        None => unquote(v),
+    }
+}
+
+/// `.python code-line-numbers="true"` -> (`python`, attrs); `mermaid` ->
+/// (`mermaid`, none).
+fn static_code_open(open: &str) -> (Option<String>, Attrs) {
+    if open == "mermaid" {
+        return (Some("mermaid".to_string()), Attrs::new());
+    }
+    let mut attrs = parse_attrs(open);
+    let lang = attrs.remove("class").map(|c| {
+        let mut classes = c.split(' ');
+        let lang = classes.next().unwrap_or_default().to_string();
+        let rest: Vec<&str> = classes.collect();
+        if !rest.is_empty() {
+            attrs.insert("class".to_string(), rest.join(" "));
+        }
+        lang
+    });
+    (lang, attrs)
+}
+
+/// A callout's kind: its `callout-*` class, refined by an extra class
+/// naming a MyST-only kind (written by the MyST->Quarto direction).
+fn callout_kind(classes: &[&str]) -> Option<AdmonitionKind> {
+    let base = classes.iter().find_map(|c| match *c {
+        "callout-note" => Some(AdmonitionKind::Note),
+        "callout-warning" => Some(AdmonitionKind::Warning),
+        "callout-tip" => Some(AdmonitionKind::Tip),
+        "callout-important" => Some(AdmonitionKind::Important),
+        "callout-caution" => Some(AdmonitionKind::Caution),
+        _ => None,
+    })?;
+    let refined = classes.iter().find_map(|c| match *c {
+        "hint" => Some(AdmonitionKind::Hint),
+        "seealso" => Some(AdmonitionKind::SeeAlso),
+        "attention" => Some(AdmonitionKind::Attention),
+        "danger" => Some(AdmonitionKind::Danger),
+        "error" => Some(AdmonitionKind::Error),
+        "dropdown" => Some(AdmonitionKind::Dropdown),
+        _ => None,
+    });
+    Some(refined.unwrap_or(base))
+}
+
+/// A div's `> ` quote lines, with a trailing `> — Author` attribution split
+/// off.
+fn split_quote(body: &[String]) -> (Vec<String>, Option<Vec<String>>) {
+    let lines: Vec<String> = body
+        .iter()
+        .map(|l| {
+            let t = l.trim_start();
+            t.strip_prefix("> ")
+                .or_else(|| t.strip_prefix('>'))
+                .unwrap_or(t)
+                .to_string()
+        })
+        .collect();
+    let start = lines
+        .iter()
+        .rposition(|l| !l.starts_with('\u{2014}'))
+        .map_or(0, |i| i + 1);
+    let attribution: Vec<String> = lines[start..]
+        .iter()
+        .map(|l| l.trim_start_matches('\u{2014}').trim().to_string())
+        .collect();
+    (
+        lines[..start].to_vec(),
+        (!attribution.is_empty()).then_some(attribution),
+    )
 }
 
 impl QuartoReader {
@@ -621,6 +868,35 @@ mod tests {
         );
         assert!(
             matches!(&doc.blocks[1].kind, BlockKind::Include { target, .. } if target == &PathBuf::from("_part.qmd"))
+        );
+    }
+
+    #[test]
+    fn attribute_values_keep_their_spaces_and_classes_accumulate() {
+        let attrs = parse_attrs(
+            r#"#fig-x .callout-tip .dropdown title="Custom title" collapse=true k="a \"q\" b""#,
+        );
+        assert_eq!(attrs.get("id").map(String::as_str), Some("fig-x"));
+        assert_eq!(
+            attrs.get("class").map(String::as_str),
+            Some("callout-tip dropdown")
+        );
+        assert_eq!(attrs.get("title").map(String::as_str), Some("Custom title"));
+        assert_eq!(attrs.get("collapse").map(String::as_str), Some("true"));
+        assert_eq!(attrs.get("k").map(String::as_str), Some(r#"a "q" b"#));
+    }
+
+    #[test]
+    fn mermaid_and_attributed_code_are_static_not_cells() {
+        let reader = QuartoReader::new(ReaderContext::new("a.qmd"));
+        let doc = reader
+            .read_str("```{mermaid}\ngraph LR; A-->B\n```\n\n```{.python code-line-numbers=\"true\"}\nx\n```\n")
+            .unwrap();
+        assert!(
+            matches!(&doc.blocks[0].kind, BlockKind::StaticCode { lang: Some(l), .. } if l == "mermaid")
+        );
+        assert!(
+            matches!(&doc.blocks[1].kind, BlockKind::StaticCode { lang: Some(l), attrs, .. } if l == "python" && attrs.get("code-line-numbers").map(String::as_str) == Some("true"))
         );
     }
 

@@ -1,0 +1,4 @@
+<!-- mystquarto-roundtrip: stable -->
+```{mermaid}
+graph LR; A-->B
+```

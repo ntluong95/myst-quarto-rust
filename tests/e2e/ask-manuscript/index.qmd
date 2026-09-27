@@ -1,0 +1,70 @@
+---
+title: "Probe Manuscript"
+author:
+  - name: Jane Smith
+    affiliations: [Uni]
+bibliography: literature/references.bib
+---
+
+{{< include manuscript/sections/_intro.qmd >}}
+
+# Methods {#sec-methods}
+
+We fit a model [@smith2020; @doe2021]. @smith2020 showed this.
+
+$$
+y = \beta x + \epsilon
+$$ {#eq-model}
+
+See @eq-model and @fig-main and @tbl-demo and @sec-methods.
+
+![Main result figure](images/fig1.png){#fig-main width=60%}
+
+| A | B |
+|---|---|
+| 1 | 2 |
+
+: Demo table {#tbl-demo}
+
+::: {.callout-note}
+A note callout.
+:::
+
+::: {.callout-warning title="Careful"}
+Warning with title.
+:::
+
+::: {.panel-tabset}
+## Tab one
+One
+## Tab two
+Two
+:::
+
+::: {.column-margin}
+Margin text.
+:::
+
+```{python}
+#| label: fig-py
+#| fig-cap: "Python fig"
+#| echo: false
+x = 1 + 1
+print(x)
+```
+
+Inline value `{python} x`.
+
+::: {#fig-panel layout-ncol=2}
+![A](images/fig1.png){#fig-a}
+
+![B](images/fig1.png){#fig-b}
+
+Panel figure
+:::
+
+Footnote here.[^1]
+
+[^1]: The footnote.
+
+<!-- a comment -->

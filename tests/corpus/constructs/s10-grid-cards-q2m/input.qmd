@@ -1,0 +1,14 @@
+<!-- mystquarto-roundtrip: stable -->
+::: {.grid}
+::: {.card .g-col-12 .g-col-md-6}
+**Card A**
+
+Body A
+:::
+
+::: {.card .g-col-12 .g-col-md-6}
+**Card B**
+
+Body B
+:::
+:::

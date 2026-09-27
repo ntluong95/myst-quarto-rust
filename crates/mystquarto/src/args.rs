@@ -5,8 +5,7 @@
 //! plus this phase's `--force` (required by the `--in-place` safety
 //! contract — see `crate::orchestrate`). `--no-preserve` and
 //! `--format json` are deliberately **not** present: the phase spec drops
-//! both (they contradicted later-phase decisions). `--no-label-map` is
-//! present but inert this phase — see its field doc.
+//! both (they contradicted later-phase decisions).
 
 use std::path::PathBuf;
 
@@ -23,6 +22,13 @@ pub enum StrictLevel {
     All,
 }
 
+/// `--scope`: how the conversion's file set is chosen.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    Manuscript,
+    All,
+}
+
 /// Flags shared by all three binaries for a single conversion invocation.
 /// The direction (MyST->Quarto vs. Quarto->MyST) is fixed by which binary,
 /// or which `mystquarto` subcommand, is running — it is not a flag on this
@@ -32,11 +38,20 @@ pub struct ConvertArgs {
     /// Input file or directory to convert.
     pub input: PathBuf,
 
-    /// Output directory. Defaults to `<input>-quarto` / `<input>-myst`
-    /// (matching the Python CLI). Ignored when `--in-place` is set — see
-    /// that field's doc.
+    /// Output directory (required unless `--in-place`). It must not exist,
+    /// or be empty, or hold this tool's own previous output of the same
+    /// direction; it must not sit inside the input unless gitignored.
     #[arg(short = 'o', long = "output", value_name = "DIR")]
     pub output: Option<PathBuf>,
+
+    /// Which files to read. `manuscript` (default): everything reachable
+    /// from the project config, or, without a config, a directory walk that
+    /// skips agent/tooling files (`AGENTS.md`, `CLAUDE.md`, `README.md`,
+    /// `CHANGELOG.md`, `plans/`). `all`: the directory walk without that
+    /// exclusion. `.gitignore` and the governed-location denylist apply to
+    /// both.
+    #[arg(long = "scope", value_enum, default_value_t = Scope::Manuscript)]
+    pub scope: Scope,
 
     /// Overwrite source files in place instead of writing to a separate
     /// output directory. When set, `--output` is ignored (parity with the
@@ -88,10 +103,8 @@ pub struct ConvertArgs {
     #[arg(long = "force")]
     pub force: bool,
 
-    /// Retained for CLI compatibility with the Python tool. The label-map
-    /// sidecar this flag would suppress does not exist until a later
-    /// phase's sidecar work; this phase accepts and stores the flag but
-    /// wires no behavior to it.
+    /// Do not write `.mystquarto/labels.json`, the label map a reverse
+    /// conversion uses to restore original MyST labels.
     #[arg(long = "no-label-map")]
     pub no_label_map: bool,
 }
@@ -100,6 +113,7 @@ pub struct ConvertArgs {
 #[derive(Parser, Debug)]
 #[command(
     name = "myst2quarto",
+    version,
     about = "Convert MyST markdown files to Quarto format"
 )]
 pub struct Myst2QuartoCli {
@@ -111,6 +125,7 @@ pub struct Myst2QuartoCli {
 #[derive(Parser, Debug)]
 #[command(
     name = "quarto2myst",
+    version,
     about = "Convert Quarto markdown files to MyST format"
 )]
 pub struct Quarto2MystCli {
@@ -123,7 +138,11 @@ pub struct Quarto2MystCli {
 /// Python `click.Group(invoke_without_command=True)` behavior:
 /// `mystquarto` alone is not an error).
 #[derive(Parser, Debug)]
-#[command(name = "mystquarto", about = "Bidirectional MyST <-> Quarto converter")]
+#[command(
+    name = "mystquarto",
+    version,
+    about = "Bidirectional MyST <-> Quarto converter"
+)]
 pub struct MystquartoCli {
     #[command(subcommand)]
     pub command: Option<MystquartoCommand>,

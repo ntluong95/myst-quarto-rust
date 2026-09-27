@@ -1,0 +1,7 @@
+# Lines allowed to differ after a full round trip, as `<file>: <trimmed line>`.
+
+# Author affiliations travel through MyST's top-level `affiliations` list and
+# are re-emitted in YAML block style; the data is unchanged.
+index.qmd: affiliations: [Uni]
+index.qmd: affiliations:
+index.qmd: - Uni

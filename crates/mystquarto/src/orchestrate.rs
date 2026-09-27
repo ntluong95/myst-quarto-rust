@@ -50,16 +50,18 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
+use mystquarto_core::closure;
+use mystquarto_core::config::snapshot::Restored;
 use mystquarto_core::diagnostics::{codes, Diagnostic, Severity};
 use mystquarto_core::fs::assets::{self, AssetCopyReport};
 use mystquarto_core::fs::atomic::write_atomic;
 use mystquarto_core::fs::path_guard;
 use mystquarto_core::pipeline::{self, BatchFileError};
-use mystquarto_core::preserve::{self, PreservedEntry};
+use mystquarto_core::preserve::{self, ConfigSnapshot, IgnoredConfig, PreservedEntry};
 use mystquarto_core::{notebook, registry::sidecar};
 
-use crate::args::{ConvertArgs, StrictLevel};
-use crate::discover::{self, Direction};
+use crate::args::{ConvertArgs, Scope, StrictLevel};
+use crate::discover::Direction;
 
 /// Relative path (from an output root) of the label/preservation sidecar
 /// directory.
@@ -129,10 +131,8 @@ impl RunReport {
 
     /// `true` if this run should exit non-zero regardless of `--strict`:
     /// any real (non-dry-run) file failure, or an unresolved config
-    /// conflict. Severity::Error-class diagnostics (see
-    /// `mystquarto_core::diagnostics::Severity`) already flow through this
-    /// path today via `FileStatus::Failed`, not a constructed `Diagnostic`
-    /// — see that type's docs.
+    /// conflict, or any `Severity::Error` diagnostic (a reference into a
+    /// governed location).
     #[must_use]
     pub fn has_failures(&self) -> bool {
         self.config_conflict.is_some()
@@ -140,6 +140,7 @@ impl RunReport {
                 .outcomes
                 .iter()
                 .any(|o| matches!(o.status, FileStatus::Failed(_)))
+            || self.warnings.iter().any(|d| d.severity == Severity::Error)
     }
 
     /// `true` if `strict` promotes at least one diagnostic already in
@@ -174,40 +175,169 @@ pub fn execute(args: &ConvertArgs, direction: Direction) -> Result<RunReport> {
         .with_context(|| format!("could not resolve input path {}", args.input.display()))?;
     let is_dir = input_meta.is_dir();
 
-    let output_hint = if args.in_place {
+    // The project the input belongs to: the directory itself, or for a
+    // single file the nearest ancestor holding the source config (else a
+    // git root, else the file's own directory).
+    let input_dir = if is_dir {
         canonical_input.clone()
-    } else if let Some(explicit) = &args.output {
-        explicit.clone()
     } else {
-        let base = if is_dir {
+        enclosing_root(&canonical_input, direction)
+    };
+
+    let output_hint = if args.in_place {
+        if input_dir.join(".ask").is_dir() {
+            bail!(
+                "--in-place refuses to run in an agent-science-kit project ({} has .ask/): \
+                 Quarto is the canonical source there. Convert into a separate directory \
+                 with -o instead.",
+                input_dir.display()
+            );
+        }
+        if is_dir {
             canonical_input.clone()
         } else {
             canonical_input
                 .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from("."))
+                .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+        }
+    } else if let Some(explicit) = &args.output {
+        explicit.clone()
+    } else {
+        let name = input_dir
+            .file_name()
+            .map_or_else(|| "project".into(), |n| n.to_string_lossy().into_owned());
+        let suffix = match direction {
+            Direction::MystToQuarto => "quarto",
+            Direction::QuartoToMyst => "myst",
         };
-        default_output_dir(&base, direction)
+        bail!(
+            "-o/--output is required: the tool never picks an output location for you, so it \
+             cannot write into the project or its parent folder by accident. For example: \
+             -o \"$(mktemp -d)/{name}-{suffix}\""
+        );
     };
     let effective_output_root = path_guard::canonicalize_best_effort(&output_hint)
         .with_context(|| format!("could not resolve output path {}", output_hint.display()))?;
+
+    let previous_output = if args.in_place {
+        false
+    } else {
+        check_output_dir(&input_dir, &effective_output_root, direction)?
+    };
 
     if args.in_place && !args.dry_run {
         check_in_place_preconditions(&canonical_input, args.force)?;
     }
 
-    let mut report = if is_dir {
-        execute_directory(args, direction, &canonical_input, &effective_output_root)?
+    let selection = if is_dir {
+        select_project(args, direction, &canonical_input, &effective_output_root)
     } else {
-        execute_single_file(args, direction, &canonical_input, &effective_output_root)?
+        select_file(
+            args,
+            direction,
+            &canonical_input,
+            &input_dir,
+            &effective_output_root,
+        )
     };
+    let suppress_path = selection.root.join(SIDECAR_DIR).join(SUPPRESS_FILE);
+    let mut report = execute_selection(
+        args,
+        direction,
+        selection,
+        &effective_output_root,
+        previous_output,
+    )?;
 
-    let suppressed = load_suppressed_codes(&canonical_input.join(SIDECAR_DIR).join(SUPPRESS_FILE));
+    if !args.dry_run && !args.in_place {
+        write_output_marker(&effective_output_root, direction)?;
+    }
+
+    let suppressed = load_suppressed_codes(&suppress_path);
     if !suppressed.is_empty() {
         report.warnings.retain(|d| !suppressed.contains(d.code));
     }
 
     Ok(report)
+}
+
+/// Marks an output directory as this tool's own, so a later run of the same
+/// direction may write into it again. Deterministic content, so converting
+/// twice stays byte-identical.
+const OUTPUT_MARKER_FILE: &str = "output.json";
+
+fn direction_name(direction: Direction) -> &'static str {
+    match direction {
+        Direction::MystToQuarto => "to-quarto",
+        Direction::QuartoToMyst => "to-myst",
+    }
+}
+
+fn write_output_marker(output_root: &Path, direction: Direction) -> Result<()> {
+    let path = output_root.join(SIDECAR_DIR).join(OUTPUT_MARKER_FILE);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("could not create {}", parent.display()))?;
+    }
+    let text = format!(
+        "{{\"tool\": \"mystquarto\", \"direction\": \"{}\"}}\n",
+        direction_name(direction)
+    );
+    write_atomic(&path, text.as_bytes())
+        .with_context(|| format!("could not write {}", path.display()))
+}
+
+fn read_output_marker(output_root: &Path) -> Option<String> {
+    let text = fs::read_to_string(output_root.join(SIDECAR_DIR).join(OUTPUT_MARKER_FILE)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    (value.get("tool")?.as_str()? == "mystquarto")
+        .then(|| value.get("direction")?.as_str().map(str::to_string))
+        .flatten()
+}
+
+/// The output-directory rules. The output must not sit inside the input
+/// unless gitignored, and it must not exist, be empty, or be this tool's
+/// own previous output of the same direction. Anything else — above all an
+/// existing project — is refused before a byte is written, so a conversion
+/// can never merge into one. Returns `true` for a previous output.
+fn check_output_dir(input_dir: &Path, output_root: &Path, direction: Direction) -> Result<bool> {
+    let refuse = |why: String| -> Result<bool> {
+        bail!(
+            "{}: refusing output directory {}: {why}",
+            codes::io::OUTPUT_DIR_REFUSED,
+            output_root.display()
+        )
+    };
+    if path_guard::is_descendant(input_dir, output_root)
+        && (output_root == input_dir || !closure::is_gitignored_dir(input_dir, output_root))
+    {
+        return refuse(format!(
+            "it is inside the input {} and not gitignored; choose a directory outside the \
+             project (for example under $(mktemp -d)) or a gitignored one",
+            input_dir.display()
+        ));
+    }
+    let entries = match fs::read_dir(output_root) {
+        Ok(entries) => entries,
+        Err(_) if !output_root.exists() => return Ok(false),
+        Err(e) => return refuse(format!("it cannot be read as a directory ({e})")),
+    };
+    if entries.count() == 0 {
+        return Ok(false);
+    }
+    match read_output_marker(output_root) {
+        Some(d) if d == direction_name(direction) => Ok(true),
+        Some(d) => refuse(format!(
+            "it holds this tool's `{d}` output, not `{}` output; use a separate directory",
+            direction_name(direction)
+        )),
+        None => refuse(
+            "it exists and is not empty, and it is not this tool's previous output. A \
+             conversion never merges into an existing project; use a new or empty directory \
+             and move the files you want by hand"
+                .to_string(),
+        ),
+    }
 }
 
 /// Reads `.mystquarto/suppress.toml`'s `codes = ["MQ0410", ...]` array, as
@@ -241,18 +371,250 @@ fn load_suppressed_codes(path: &Path) -> std::collections::BTreeSet<String> {
     out
 }
 
-fn execute_directory(
+/// What one run converts: a root every path is under (output mirrors
+/// it), the files, and where the target config comes from.
+struct Selection {
+    root: PathBuf,
+    file_set: closure::FileSet,
+    config: ConfigChoice,
+}
+
+enum ConfigChoice {
+    /// No config to write (bare folder, or `--in-place` on a single file).
+    None,
+    /// Convert this source config.
+    Convert(PathBuf),
+    /// Write a minimal config naming this single file.
+    Synthesize(PathBuf),
+}
+
+fn config_dialect(direction: Direction) -> closure::ConfigDialect {
+    match direction {
+        Direction::MystToQuarto => closure::ConfigDialect::Myst,
+        Direction::QuartoToMyst => closure::ConfigDialect::Quarto,
+    }
+}
+
+/// The nearest ancestor of `file` holding the source config, else the
+/// nearest holding a git directory, else the file's own directory.
+fn enclosing_root(file: &Path, direction: Direction) -> PathBuf {
+    let parent = file
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let find = |marker: &str| {
+        parent
+            .ancestors()
+            .find(|d| d.join(marker).exists())
+            .map(Path::to_path_buf)
+    };
+    find(direction.source_config_name())
+        .or_else(|| find(".git"))
+        .unwrap_or(parent)
+}
+
+/// A project directory: its config closure, or a filtered walk.
+fn select_project(
     args: &ConvertArgs,
     direction: Direction,
-    canonical_input: &Path,
+    root: &Path,
+    output_root: &Path,
+) -> Selection {
+    let config = root.join(direction.source_config_name());
+    let has_config = config.is_file();
+    let start = match (args.scope, has_config) {
+        (Scope::All, _) => closure::Start::Walk { all: true },
+        (Scope::Manuscript, false) => closure::Start::Walk { all: false },
+        (Scope::Manuscript, true) => closure::Start::Config {
+            path: &config,
+            dialect: config_dialect(direction),
+        },
+    };
+    let file_set = closure::resolve(&closure::Request {
+        root,
+        output_root: Some(output_root),
+        source_ext: direction.source_extension(),
+        start,
+    });
+    Selection {
+        root: root.to_path_buf(),
+        file_set,
+        config: if has_config {
+            ConfigChoice::Convert(config)
+        } else {
+            ConfigChoice::None
+        },
+    }
+}
+
+/// A single file is a one-article project rooted at that file. When the
+/// enclosing project's config already names it, that is the same as
+/// converting the project, so the project's closure and config are used.
+/// Otherwise the closure starts from the file (includes, figures,
+/// bibliography, embeds), output mirrors the closure's common ancestor so
+/// `../` references keep resolving, and a minimal config is written.
+fn select_file(
+    args: &ConvertArgs,
+    direction: Direction,
+    file: &Path,
+    project_root: &Path,
+    output_root: &Path,
+) -> Selection {
+    let config = project_root.join(direction.source_config_name());
+    let mut hint = None;
+    if config.is_file() {
+        hint = Some(
+            Diagnostic::new(
+                Severity::Info,
+                codes::config::SINGLE_FILE_IN_PROJECT,
+                format!(
+                    "this file belongs to the project at {}; converting the project root is \
+                     usually what you want",
+                    project_root.display()
+                ),
+            )
+            .with_file(file.to_path_buf()),
+        );
+        let mut project = select_project(args, direction, project_root, output_root);
+        if !args.in_place && project.file_set.content.iter().any(|c| c == file) {
+            project.file_set.diagnostics.extend(hint);
+            return project;
+        }
+    }
+
+    let files = [file.to_path_buf()];
+    let mut file_set = closure::resolve(&closure::Request {
+        root: project_root,
+        output_root: Some(output_root),
+        source_ext: direction.source_extension(),
+        start: closure::Start::Files(&files),
+    });
+    file_set.diagnostics.extend(hint);
+    let root = if args.in_place {
+        file.parent()
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+    } else {
+        common_ancestor(
+            file_set
+                .content
+                .iter()
+                .chain(&file_set.notebooks)
+                .chain(&file_set.assets),
+        )
+        .unwrap_or_else(|| project_root.to_path_buf())
+    };
+    Selection {
+        root,
+        file_set,
+        config: if args.in_place {
+            ConfigChoice::None
+        } else {
+            ConfigChoice::Synthesize(file.to_path_buf())
+        },
+    }
+}
+
+/// The deepest directory containing every path.
+fn common_ancestor<'a>(paths: impl Iterator<Item = &'a PathBuf>) -> Option<PathBuf> {
+    let mut common: Option<PathBuf> = None;
+    for path in paths {
+        let dir = path.parent()?.to_path_buf();
+        common = Some(match common {
+            None => dir,
+            Some(c) => c
+                .ancestors()
+                .find(|a| dir.starts_with(a))
+                .map_or_else(PathBuf::new, Path::to_path_buf),
+        });
+    }
+    common
+}
+
+/// The minimal target config for a single-file run: MyST gets a one-entry
+/// toc (plus the page's bibliography, rebased to the root); Quarto gets a
+/// default project that renders the file.
+fn synthesized_config(direction: Direction, root: &Path, file: &Path) -> String {
+    use mystquarto_core::yaml::emit::{emit, EmitField, YamlDoc};
+    use mystquarto_core::YamlValue;
+    let slash = |p: &Path| p.to_string_lossy().replace('\\', "/");
+    let rel = slash(&swap_extension(
+        file.strip_prefix(root).unwrap_or(file),
+        direction,
+    ));
+    let doc = match direction {
+        Direction::QuartoToMyst => {
+            let mut project = vec![(
+                "toc".to_string(),
+                YamlValue::Sequence(vec![YamlValue::Mapping(vec![(
+                    "file".to_string(),
+                    YamlValue::String(rel),
+                )])]),
+            )];
+            let page_dir = file.parent().unwrap_or(root);
+            let bibs: Vec<YamlValue> = fs::read_to_string(file)
+                .map(|t| {
+                    mystquarto_core::config::bibliography::frontmatter_bibliography_entries(&t)
+                })
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|b| {
+                    let abs = page_dir.join(b);
+                    let abs = abs.canonicalize().unwrap_or(abs);
+                    abs.strip_prefix(root)
+                        .ok()
+                        .map(|r| YamlValue::String(slash(r)))
+                })
+                .collect();
+            if !bibs.is_empty() {
+                project.push(("bibliography".to_string(), YamlValue::Sequence(bibs)));
+            }
+            // Without a site template `myst build --html` writes nothing;
+            // the article theme also reads back as a one-article manuscript.
+            vec![
+                EmitField::new("version", YamlValue::Int(1)),
+                EmitField::new("project", YamlValue::Mapping(project)),
+                EmitField::new(
+                    "site",
+                    YamlValue::Mapping(vec![(
+                        "template".to_string(),
+                        YamlValue::String("article-theme".to_string()),
+                    )]),
+                ),
+            ]
+        }
+        Direction::MystToQuarto => vec![EmitField::new(
+            "project",
+            YamlValue::Mapping(vec![
+                ("type".to_string(), YamlValue::String("default".to_string())),
+                (
+                    "render".to_string(),
+                    YamlValue::Sequence(vec![YamlValue::String(rel)]),
+                ),
+            ]),
+        )],
+    };
+    emit(&YamlDoc(doc))
+}
+
+/// Carries out a [`Selection`]: converts content and config, copies
+/// assets, and writes the sidecars.
+fn execute_selection(
+    args: &ConvertArgs,
+    direction: Direction,
+    selection: Selection,
     effective_output_root: &Path,
+    previous_output: bool,
 ) -> Result<RunReport> {
-    let discovered =
-        discover::discover_files(canonical_input, direction, Some(effective_output_root));
-    let source_config_name = direction.source_config_name();
-    let (config_files, content_files): (Vec<PathBuf>, Vec<PathBuf>) = discovered
-        .into_iter()
-        .partition(|p| p.file_name().and_then(|n| n.to_str()) == Some(source_config_name));
+    let Selection {
+        root,
+        file_set,
+        config,
+    } = selection;
+    let canonical_input = root.as_path();
+    let config_files: Vec<PathBuf> = match &config {
+        ConfigChoice::Convert(path) => vec![path.clone()],
+        _ => Vec::new(),
+    };
+    let content_files = file_set.content.clone();
 
     if !args.dry_run {
         fs::create_dir_all(effective_output_root).with_context(|| {
@@ -265,7 +627,17 @@ fn execute_directory(
 
     let mut outcomes = Vec::new();
     let mut config_conflict = None;
-    let mut warnings: Vec<Diagnostic> = Vec::new();
+    let mut warnings: Vec<Diagnostic> = file_set.diagnostics.clone();
+    for path in &file_set.skipped_symlinks {
+        warnings.push(
+            Diagnostic::new(
+                Severity::Warning,
+                codes::io::SYMLINK_ASSET_SKIPPED,
+                "symlink skipped without dereferencing its target".to_string(),
+            )
+            .with_file(path.clone()),
+        );
+    }
 
     // Batch-convert every content file up front (Phase 5's run-scoped
     // `LabelRegistry` requires seeing every document before deciding any
@@ -277,8 +649,8 @@ fn execute_directory(
     } else {
         Some(run_content_batch(
             &content_files,
+            &file_set.notebooks,
             canonical_input,
-            effective_output_root,
             direction,
         ))
     };
@@ -293,6 +665,11 @@ fn execute_directory(
     }
 
     if !args.no_config {
+        let ignored_config = if config_files.is_empty() {
+            None
+        } else {
+            ignore_target_config_in_input(canonical_input, direction, args.dry_run, &mut warnings)
+        };
         for config_path in &config_files {
             let out_config_path = effective_output_root.join(direction.target_config_name());
 
@@ -305,7 +682,9 @@ fn execute_directory(
                 continue;
             }
 
-            if out_config_path.exists() && !args.force {
+            // A previous output's config is this tool's own; only a
+            // hand-authored one (possible under --in-place) needs --force.
+            if out_config_path.exists() && !args.force && !previous_output {
                 let conflict_path = alongside_new_path(&out_config_path);
                 outcomes.push(FileOutcome {
                     input: config_path.clone(),
@@ -321,17 +700,34 @@ fn execute_directory(
                 continue;
             }
 
-            match convert_config_file(
+            let written = convert_config_file(
                 config_path,
                 direction,
                 canonical_input,
                 effective_output_root,
+                &content_files,
                 &batch,
-            ) {
-                Ok((text, config_warnings)) => {
-                    write_atomic(&out_config_path, text.as_bytes()).with_context(|| {
-                        format!("could not write {}", out_config_path.display())
-                    })?;
+            )
+            .and_then(|converted| {
+                write_atomic(&out_config_path, converted.text.as_bytes())
+                    .with_context(|| format!("could not write {}", out_config_path.display()))?;
+                let record_path = effective_output_root
+                    .join(SIDECAR_DIR)
+                    .join(PRESERVED_CONFIG_FILE);
+                preserve::write_config_record(
+                    Some(ConfigSnapshot {
+                        name: direction.source_config_name().to_string(),
+                        source: converted.source,
+                        derived: converted.text,
+                    }),
+                    ignored_config.clone(),
+                    &record_path,
+                )
+                .with_context(|| format!("could not write {}", record_path.display()))?;
+                Ok(converted.warnings)
+            });
+            match written {
+                Ok(config_warnings) => {
                     outcomes.push(FileOutcome {
                         input: config_path.clone(),
                         output: out_config_path,
@@ -343,11 +739,32 @@ fn execute_directory(
                     outcomes.push(FileOutcome {
                         input: config_path.clone(),
                         output: out_config_path,
-                        status: FileStatus::Failed(e.to_string()),
+                        status: FileStatus::Failed(format!("{e:#}")),
                     });
                 }
             }
         }
+    }
+
+    if let (ConfigChoice::Synthesize(file), false, false) = (&config, args.no_config, args.dry_run)
+    {
+        let out_config_path = effective_output_root.join(direction.target_config_name());
+        write_atomic(
+            &out_config_path,
+            synthesized_config(direction, canonical_input, file).as_bytes(),
+        )
+        .with_context(|| format!("could not write {}", out_config_path.display()))?;
+        warnings.push(
+            Diagnostic::new(
+                Severity::Info,
+                codes::config::CONFIG_SYNTHESIZED,
+                format!(
+                    "wrote a minimal {} naming this file so the output builds on its own",
+                    direction.target_config_name()
+                ),
+            )
+            .with_file(file.clone()),
+        );
     }
 
     let mut assets_report = None;
@@ -411,15 +828,14 @@ fn execute_directory(
         }
 
         if !args.in_place && !args.dry_run {
-            let content_ext = [direction.source_extension()];
-            let config_names = [source_config_name];
-            let report = assets::copy_assets(
-                canonical_input,
-                effective_output_root,
-                &content_ext,
-                &config_names,
-            )
-            .context("asset copy failed")?;
+            let files: Vec<PathBuf> = file_set
+                .assets
+                .iter()
+                .chain(&file_set.notebooks)
+                .cloned()
+                .collect();
+            let report = assets::copy_files(canonical_input, effective_output_root, &files)
+                .context("asset copy failed")?;
             for path in &report.skipped_symlinks {
                 warnings.push(
                     Diagnostic::new(
@@ -532,16 +948,18 @@ impl ContentBatch {
 /// [`relabel_and_write_sidecar`]'s call site.
 fn run_content_batch(
     content_files: &[PathBuf],
+    notebooks: &[PathBuf],
     canonical_input: &Path,
-    effective_output_root: &Path,
     direction: Direction,
 ) -> ContentBatch {
-    let notebooks = discover::discover_notebooks(canonical_input, Some(effective_output_root));
-
     match direction {
         Direction::MystToQuarto => {
-            let result =
-                pipeline::convert_myst_to_quarto_batch(content_files, &notebooks, canonical_input);
+            let result = pipeline::convert_myst_to_quarto_batch_with(
+                content_files,
+                notebooks,
+                canonical_input,
+                converts_to_quarto_book(canonical_input),
+            );
             ContentBatch::MystToQuarto {
                 rendered: result.rendered,
                 errors: result.errors,
@@ -557,7 +975,7 @@ fn run_content_batch(
             let sidecar_path = sidecar_path.exists().then_some(sidecar_path);
             let result = pipeline::convert_quarto_to_myst_batch(
                 content_files,
-                &notebooks,
+                notebooks,
                 canonical_input,
                 sidecar_path.as_deref(),
             );
@@ -569,6 +987,18 @@ fn run_content_batch(
             }
         }
     }
+}
+
+/// `true` when `root`'s `myst.yml` becomes a Quarto book, the one project
+/// type where `@id` resolves across documents.
+fn converts_to_quarto_book(root: &Path) -> bool {
+    fs::read_to_string(root.join("myst.yml"))
+        .ok()
+        .and_then(|t| mystquarto_core::yaml::parse_mapping(&t).ok())
+        .is_some_and(|m| {
+            mystquarto_core::config::project_type::infer(&m)
+                == mystquarto_core::config::ProjectType::Book
+        })
 }
 
 /// **C1 fix.** Refuses the whole run *before any file is written or
@@ -655,10 +1085,94 @@ fn write_preserved_content_sidecar(
     Ok(())
 }
 
-/// Converts one config file (`myst.yml`/`_quarto.yml`) and returns its
-/// rendered text plus any non-fatal notices — bibliography synthesis and the
-/// RT-14 missing-citation diagnostic for `MystToQuarto`, or the restored
-/// `.mystquarto/preserved.json` fields for `QuartoToMyst`.
+/// A converted config file, ready to write.
+struct ConvertedConfig {
+    /// The source config's exact text, recorded in the snapshot.
+    source: String,
+    /// The target config text to write.
+    text: String,
+    warnings: Vec<Diagnostic>,
+}
+
+/// If the input also holds the *target* dialect's config (ASK projects
+/// used to ship a hand-kept `myst.yml` beside `_quarto.yml`), it is a stale
+/// source artifact: the run converts the source config instead, says so, and
+/// keeps the ignored text in the sidecar so nothing the user wrote is lost.
+fn ignore_target_config_in_input(
+    canonical_input: &Path,
+    direction: Direction,
+    dry_run: bool,
+    warnings: &mut Vec<Diagnostic>,
+) -> Option<IgnoredConfig> {
+    let name = direction.target_config_name();
+    let path = canonical_input.join(name);
+    let text = fs::read_to_string(&path).ok()?;
+    warnings.push(
+        Diagnostic::new(
+            Severity::Info,
+            codes::config::TARGET_CONFIG_IN_INPUT_IGNORED,
+            format!(
+                "ignored the input's own {name}; converted {} instead{}",
+                direction.source_config_name(),
+                if dry_run {
+                    ""
+                } else {
+                    " and kept the ignored text in .mystquarto/preserved.json"
+                }
+            ),
+        )
+        .with_file(path),
+    );
+    Some(IgnoredConfig {
+        name: name.to_string(),
+        text,
+    })
+}
+
+/// A config conversion's text, diagnostics, and (MyST->Quarto only) the
+/// `myst.yml` fields preserved for the reverse direction.
+type ConfigText = (
+    String,
+    Vec<Diagnostic>,
+    Option<std::collections::BTreeMap<String, mystquarto_core::YamlValue>>,
+);
+
+/// Converts `text` (a whole source config) with no side effects — the part
+/// of [`convert_config_file`] the snapshot merge also needs for its base.
+fn convert_config_text(
+    text: &str,
+    direction: Direction,
+    canonical_input: &Path,
+) -> Result<ConfigText, mystquarto_core::yaml::YamlReadError> {
+    match direction {
+        Direction::MystToQuarto => {
+            let bib_path = find_bib_file(canonical_input);
+            let result =
+                mystquarto_core::config::myst_to_quarto::convert(text, bib_path.as_deref())?;
+            Ok((result.text, result.warnings, Some(result.preserved_fields)))
+        }
+        Direction::QuartoToMyst => {
+            let sidecar_path = canonical_input
+                .join(SIDECAR_DIR)
+                .join(PRESERVED_CONFIG_FILE);
+            let preserved = mystquarto_core::config::sidecar::read(&sidecar_path).map(|p| {
+                p.fields
+                    .iter()
+                    .map(|(k, v)| (k.clone(), mystquarto_core::config::sidecar::json_to_yaml(v)))
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            });
+            let result =
+                mystquarto_core::config::quarto_to_myst::convert(text, preserved.as_ref())?;
+            Ok((result.text, result.warnings, None))
+        }
+    }
+}
+
+/// Converts one config file (`myst.yml`/`_quarto.yml`): the plain
+/// conversion, then bibliography synthesis and the RT-14 missing-citation
+/// check (`MystToQuarto`), then — when the input carries a snapshot a
+/// previous conversion recorded — restoration of the original config (see
+/// `mystquarto_core::config::snapshot`).
 ///
 /// The RT-14 citation-key check only runs when `batch` actually holds a
 /// `MystToQuarto` result (i.e. content was parsed this run — not under
@@ -674,99 +1188,146 @@ fn convert_config_file(
     direction: Direction,
     canonical_input: &Path,
     effective_output_root: &Path,
+    content_files: &[PathBuf],
     batch: &Option<ContentBatch>,
-) -> Result<(String, Vec<Diagnostic>)> {
-    let text = fs::read_to_string(config_path)
+) -> Result<ConvertedConfig> {
+    let source = fs::read_to_string(config_path)
         .with_context(|| format!("could not read {}", config_path.display()))?;
     let with_file = |ds: Vec<Diagnostic>| -> Vec<Diagnostic> {
         ds.into_iter()
             .map(|d| d.with_file(config_path.to_path_buf()))
             .collect()
     };
+    let (mut text, config_warnings, preserved_fields) =
+        convert_config_text(&source, direction, canonical_input)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", config_path.display()))?;
+    let mut warnings = with_file(config_warnings);
 
-    match direction {
-        Direction::MystToQuarto => {
-            let bib_path = find_bib_file(canonical_input);
-            let mut result =
-                mystquarto_core::config::myst_to_quarto::convert(&text, bib_path.as_deref())
-                    .map_err(|e| anyhow::anyhow!("{}: {e}", config_path.display()))?;
+    if let Some(preserved_fields) = preserved_fields {
+        // Written unconditionally, even when empty: this sidecar is the
+        // authoritative recovery channel (RT-11), so a run that removes
+        // every previously-unmappable field from myst.yml must clear the
+        // stale sidecar too, not leave it holding fields the source no
+        // longer has.
+        let sidecar_path = effective_output_root
+            .join(SIDECAR_DIR)
+            .join(PRESERVED_CONFIG_FILE);
+        mystquarto_core::config::sidecar::write(&preserved_fields, &sidecar_path)
+            .with_context(|| format!("could not write {}", sidecar_path.display()))?;
+    }
 
-            let mut warnings: Vec<Diagnostic> = with_file(result.warnings);
+    if let Some(ContentBatch::MystToQuarto {
+        used_citation_keys, ..
+    }) = batch
+    {
+        let defined = defined_citation_keys(&source, canonical_input, content_files);
+        let missing: std::collections::BTreeSet<String> =
+            used_citation_keys.difference(&defined).cloned().collect();
+        let generated_doi_refs: std::collections::BTreeSet<String> =
+            missing.into_iter().filter(|key| is_doi_key(key)).collect();
 
-            // Written unconditionally, even when empty: this sidecar is the
-            // authoritative recovery channel (RT-11), so a run that removes
-            // every previously-unmappable field from myst.yml must clear the
-            // stale sidecar too, not leave it holding fields the source no
-            // longer has.
-            let sidecar_path = effective_output_root
-                .join(SIDECAR_DIR)
-                .join(PRESERVED_CONFIG_FILE);
-            mystquarto_core::config::sidecar::write(&result.preserved_fields, &sidecar_path)
-                .with_context(|| format!("could not write {}", sidecar_path.display()))?;
-
-            if let Some(ContentBatch::MystToQuarto {
-                used_citation_keys, ..
-            }) = batch
-            {
-                let defined = if let Some(bib_rel) = &bib_path {
-                    if let Ok(bib_text) = fs::read_to_string(canonical_input.join(bib_rel)) {
-                        mystquarto_core::config::bibliography::bib_defined_keys(&bib_text)
-                    } else {
-                        std::collections::BTreeSet::new()
-                    }
-                } else {
-                    std::collections::BTreeSet::new()
-                };
-
-                let missing: std::collections::BTreeSet<String> =
-                    used_citation_keys.difference(&defined).cloned().collect();
-                let generated_doi_refs: std::collections::BTreeSet<String> =
-                    missing.into_iter().filter(|key| is_doi_key(key)).collect();
-
-                if !generated_doi_refs.is_empty() {
-                    let rel = format!("{SIDECAR_DIR}/{DOI_REFERENCES_FILE}");
-                    let path = effective_output_root.join(&rel);
-                    write_doi_bibliography_supplement(&generated_doi_refs, &path)
-                        .with_context(|| format!("could not write {}", path.display()))?;
-                    result.text = add_bibliography_path(&result.text, &rel);
-                    warnings.push(Diagnostic::new(
-                        Severity::Info,
-                        codes::bibliography::BIBLIOGRAPHY_SYNTHESIZED,
-                        format!(
-                            "generated {rel} with {} DOI citation fallback entrie(s) so \
-                             Quarto can resolve citations without MyST's live DOI lookup",
-                            generated_doi_refs.len()
-                        ),
-                    ));
-                }
-
-                let defined_or_generated = defined.union(&generated_doi_refs).cloned().collect();
-                warnings.extend(with_file(
-                    mystquarto_core::config::bibliography::missing_citation_warnings(
-                        used_citation_keys,
-                        &defined_or_generated,
-                    ),
-                ));
-            }
-
-            Ok((result.text, warnings))
+        if !generated_doi_refs.is_empty() {
+            let rel = format!("{SIDECAR_DIR}/{DOI_REFERENCES_FILE}");
+            let path = effective_output_root.join(&rel);
+            write_doi_bibliography_supplement(&generated_doi_refs, &path)
+                .with_context(|| format!("could not write {}", path.display()))?;
+            text = add_bibliography_path(&text, &rel);
+            warnings.push(Diagnostic::new(
+                Severity::Info,
+                codes::bibliography::BIBLIOGRAPHY_SYNTHESIZED,
+                format!(
+                    "generated {rel} with {} DOI citation fallback entrie(s) so \
+                     Quarto can resolve citations without MyST's live DOI lookup",
+                    generated_doi_refs.len()
+                ),
+            ));
         }
-        Direction::QuartoToMyst => {
-            let sidecar_path = canonical_input
-                .join(SIDECAR_DIR)
-                .join(PRESERVED_CONFIG_FILE);
-            let preserved = mystquarto_core::config::sidecar::read(&sidecar_path).map(|p| {
-                p.fields
-                    .iter()
-                    .map(|(k, v)| (k.clone(), mystquarto_core::config::sidecar::json_to_yaml(v)))
-                    .collect::<std::collections::BTreeMap<_, _>>()
-            });
-            let result =
-                mystquarto_core::config::quarto_to_myst::convert(&text, preserved.as_ref())
-                    .map_err(|e| anyhow::anyhow!("{}: {e}", config_path.display()))?;
-            Ok((result.text, with_file(result.warnings)))
+
+        let defined_or_generated = defined.union(&generated_doi_refs).cloned().collect();
+        warnings.extend(with_file(
+            mystquarto_core::config::bibliography::missing_citation_warnings(
+                used_citation_keys,
+                &defined_or_generated,
+            ),
+        ));
+    }
+
+    let snapshot = preserve::read(
+        &canonical_input
+            .join(SIDECAR_DIR)
+            .join(PRESERVED_CONFIG_FILE),
+    )
+    .and_then(|s| s.source_config)
+    .filter(|snap| snap.name == direction.target_config_name());
+    if let Some(snapshot) = snapshot {
+        let restored = mystquarto_core::config::snapshot::restore(&snapshot, &source, &text, |t| {
+            convert_config_text(t, direction, canonical_input).map(|(text, _, _)| text)
+        })
+        .map_err(|e| anyhow::anyhow!("{}: {e}", config_path.display()))?;
+        let how = match &restored {
+            Restored::Verbatim(_) => "restored exactly (the config was unchanged)",
+            Restored::Merged(_) => "restored with your edits merged in",
+        };
+        warnings.push(
+            Diagnostic::new(
+                Severity::Info,
+                codes::config::CONFIG_RESTORED_FROM_SNAPSHOT,
+                format!(
+                    "{} {how} from the snapshot in .mystquarto/preserved.json",
+                    direction.target_config_name()
+                ),
+            )
+            .with_file(config_path.to_path_buf()),
+        );
+        text = restored.text().to_string();
+    }
+
+    Ok(ConvertedConfig {
+        source,
+        text,
+        warnings,
+    })
+}
+
+/// Every citation key defined by a bibliography the project can reach:
+/// `myst.yml`'s `project.bibliography` (relative to the project root), a
+/// `.bib` at the root, and each page's frontmatter `bibliography`
+/// (relative to that page's directory).
+fn defined_citation_keys(
+    myst_config: &str,
+    canonical_input: &Path,
+    content_files: &[PathBuf],
+) -> std::collections::BTreeSet<String> {
+    use mystquarto_core::config::bibliography::{
+        bib_defined_keys, bibliography_entries, frontmatter_bibliography_entries,
+    };
+    let mut bibs: Vec<PathBuf> = Vec::new();
+    if let Ok(root) = mystquarto_core::yaml::parse_mapping(myst_config) {
+        if let Some((_, mystquarto_core::YamlValue::Mapping(project))) =
+            root.iter().find(|(k, _)| k == "project")
+        {
+            bibs.extend(
+                bibliography_entries(project)
+                    .into_iter()
+                    .map(|b| canonical_input.join(b)),
+            );
         }
     }
+    bibs.extend(find_bib_file(canonical_input).map(|b| canonical_input.join(b)));
+    for file in content_files {
+        let (Ok(text), Some(dir)) = (fs::read_to_string(file), file.parent()) else {
+            continue;
+        };
+        bibs.extend(
+            frontmatter_bibliography_entries(&text)
+                .into_iter()
+                .map(|b| dir.join(b)),
+        );
+    }
+    bibs.iter()
+        .filter_map(|b| fs::read_to_string(b).ok())
+        .flat_map(|text| bib_defined_keys(&text))
+        .collect()
 }
 
 fn is_doi_key(key: &str) -> bool {
@@ -974,116 +1535,6 @@ fn relabel_and_write_sidecar(
     Ok(())
 }
 
-fn execute_single_file(
-    args: &ConvertArgs,
-    direction: Direction,
-    canonical_input_file: &Path,
-    effective_output_root: &Path,
-) -> Result<RunReport> {
-    let file_name = canonical_input_file
-        .file_name()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("output"));
-    let out_rel = swap_extension(&file_name, direction);
-    let out_path = path_guard::guard_target(effective_output_root, effective_output_root, &out_rel)
-        .with_context(|| format!("output path escapes {}", effective_output_root.display()))?;
-
-    if args.dry_run {
-        return Ok(RunReport {
-            effective_output_root: effective_output_root.to_path_buf(),
-            outcomes: vec![FileOutcome {
-                input: canonical_input_file.to_path_buf(),
-                output: out_path,
-                status: FileStatus::WouldConvert,
-            }],
-            assets: None,
-            config_conflict: None,
-            warnings: Vec::new(),
-        });
-    }
-
-    fs::create_dir_all(effective_output_root).with_context(|| {
-        format!(
-            "could not create output directory {}",
-            effective_output_root.display()
-        )
-    })?;
-
-    // A lone file has no project root of its own; its parent directory is
-    // the natural scope for include/notebook resolution, matching how a
-    // relative `{include}`/`#nb:` target in the file would already be
-    // resolved on disk.
-    let input_root = canonical_input_file
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let batch = run_content_batch(
-        std::slice::from_ref(&canonical_input_file.to_path_buf()),
-        &input_root,
-        effective_output_root,
-        direction,
-    );
-    let mut warnings: Vec<Diagnostic> = batch.warnings_ref().to_vec();
-    refuse_if_in_place_would_lose_preserved_content(
-        args,
-        &input_root,
-        effective_output_root,
-        batch.preserved_entries_ref(),
-    )?;
-
-    let status = match batch.rendered().get(canonical_input_file) {
-        Some(text) => {
-            write_atomic(&out_path, text.as_bytes())
-                .with_context(|| format!("could not write {}", out_path.display()))?;
-            if args.in_place && canonical_input_file != out_path && canonical_input_file.exists() {
-                fs::remove_file(canonical_input_file).with_context(|| {
-                    format!("could not remove source {}", canonical_input_file.display())
-                })?;
-            }
-            if let ContentBatch::MystToQuarto {
-                notebook_renames,
-                sidecar,
-                ..
-            } = &batch
-            {
-                relabel_and_write_sidecar(
-                    args,
-                    &input_root,
-                    effective_output_root,
-                    notebook_renames,
-                    sidecar,
-                    &mut warnings,
-                )?;
-            }
-            write_preserved_content_sidecar(
-                batch.preserved_entries_ref(),
-                args,
-                &input_root,
-                effective_output_root,
-                &mut warnings,
-            )?;
-            FileStatus::Converted
-        }
-        None => {
-            let message = batch_error_message(batch.errors_ref(), canonical_input_file)
-                .unwrap_or_else(|| "conversion failed for an unknown reason".to_string());
-            FileStatus::Failed(message)
-        }
-    };
-
-    Ok(RunReport {
-        effective_output_root: effective_output_root.to_path_buf(),
-        outcomes: vec![FileOutcome {
-            input: canonical_input_file.to_path_buf(),
-            output: out_path,
-            status,
-        }],
-        assets: None,
-        config_conflict: None,
-        warnings,
-    })
-}
-
 /// Computes the output path for one content file inside a directory
 /// conversion, and passes it through [`path_guard::guard_target`] as
 /// defense-in-depth (the relative path is derived from a file discovery
@@ -1111,30 +1562,19 @@ fn guarded_output_path(
     )
 }
 
+/// The same rename the writers apply to include targets, so an include
+/// always names the file written here.
 fn swap_extension(rel: &Path, direction: Direction) -> PathBuf {
-    let from_ext = direction.source_extension();
-    match rel.extension().and_then(|e| e.to_str()) {
-        Some(ext) if ext == from_ext => rel.with_extension(direction.target_extension()),
-        _ => rel.to_path_buf(),
-    }
+    mystquarto_core::writer::swap_content_extension(
+        rel,
+        direction.source_extension(),
+        direction.target_extension(),
+    )
 }
 
 fn alongside_new_path(path: &Path) -> PathBuf {
     let mut os = path.as_os_str().to_os_string();
     os.push(".new");
-    PathBuf::from(os)
-}
-
-/// `<input>-quarto` / `<input>-myst` — ported from `_default_output_dir`
-/// (`convert.py:208-219`): the suffix is appended to the input path's own
-/// name, producing a sibling directory, not a subdirectory.
-fn default_output_dir(input_dir: &Path, direction: Direction) -> PathBuf {
-    let suffix = match direction {
-        Direction::MystToQuarto => "-quarto",
-        Direction::QuartoToMyst => "-myst",
-    };
-    let mut os = input_dir.as_os_str().to_os_string();
-    os.push(suffix);
     PathBuf::from(os)
 }
 
@@ -1206,7 +1646,12 @@ pub fn print_summary(report: &RunReport, dry_run: bool, strict: Option<StrictLev
         .iter()
         .filter(|o| matches!(o.status, FileStatus::Failed(_)))
         .count()
-        + usize::from(report.config_conflict.is_some());
+        + usize::from(report.config_conflict.is_some())
+        + report
+            .warnings
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .count();
     let warning_count = report
         .warnings
         .iter()
@@ -1317,7 +1762,16 @@ mod tests {
             strict: None,
             force: false,
             no_label_map: false,
+            scope: Scope::Manuscript,
         }
+    }
+
+    /// Creates `tmp/in` as the input, so `tmp/out` is a sibling rather than
+    /// a directory inside the input.
+    fn input_dir(tmp: &Path) -> PathBuf {
+        let dir = tmp.join("in");
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     fn write_myst_project(dir: &Path) {
@@ -1351,10 +1805,11 @@ mod tests {
     #[test]
     fn non_in_place_run_produces_an_outcome_per_discovered_content_file() {
         let tmp = tempdir("outcome-per-file");
-        write_myst_project(&tmp);
+        let input = input_dir(&tmp);
+        write_myst_project(&input);
         let output_dir = tmp.join("out");
 
-        let mut args = base_args(tmp.clone());
+        let mut args = base_args(input);
         args.output = Some(output_dir);
         let report = execute(&args, Direction::MystToQuarto).unwrap();
 
@@ -1377,13 +1832,10 @@ mod tests {
     }
 
     #[test]
-    fn output_pointed_at_the_input_tree_without_in_place_still_refuses_to_mutate_notebooks() {
-        // H1 regression: `-o` aimed back at (or inside) the input tree
-        // bypasses the clean-VCS gate and the config-overwrite gate, both
-        // of which key off `args.in_place` alone — but notebook
-        // relabelling and the sidecar write must *not* follow that same
-        // flag-only gate, because they mutate a file regardless of which
-        // flag caused the output root to land inside the input tree.
+    fn output_pointed_at_the_input_tree_is_refused_before_anything_is_written() {
+        // H1 regression, now closed at the door: `-o` aimed back at (or
+        // inside, when not gitignored) the input tree is refused outright,
+        // so no notebook, sidecar or content file there can be mutated.
         let tmp = tempdir("output-into-input-no-in-place");
         fs::write(tmp.join("myst.yml"), "project:\n  title: Test\n").unwrap();
         fs::write(
@@ -1394,31 +1846,199 @@ mod tests {
         let notebook_source =
             "{\"cells\":[{\"cell_type\":\"code\",\"source\":[\"#| label: nb:analysis\\n\"]}]}";
         fs::write(tmp.join("analysis.ipynb"), notebook_source).unwrap();
+        let before = snapshot(&tmp);
 
-        let mut args = base_args(tmp.clone());
-        args.output = Some(tmp.clone()); // -o pointed at the input tree itself
-        args.in_place = false; // the flag the original bug keyed off of
-        args.no_config = true; // isolate this test to the notebook-relabel gate under test
+        for output in [tmp.clone(), tmp.join("converted")] {
+            let mut args = base_args(tmp.clone());
+            args.output = Some(output);
+            let err = execute(&args, Direction::MystToQuarto)
+                .expect_err("an output inside the input must be refused");
+            assert!(
+                format!("{err}").contains(codes::io::OUTPUT_DIR_REFUSED),
+                "{err}"
+            );
+        }
+        assert_eq!(snapshot(&tmp), before, "nothing may be written");
 
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn a_figure_in_the_raw_data_tier_fails_the_run_and_is_never_copied() {
+        let tmp = tempdir("denied-figure");
+        let input = input_dir(&tmp);
+        let raw_tier = ["data", "raw"].join("/");
+        fs::create_dir_all(input.join(&raw_tier)).unwrap();
+        fs::write(input.join(&raw_tier).join("plot.png"), "secret").unwrap();
+        fs::write(
+            input.join("myst.yml"),
+            "version: 1\nproject:\n  toc:\n    - file: index.md\n",
+        )
+        .unwrap();
+        fs::write(
+            input.join("index.md"),
+            format!("# Result\n\n![Plot]({raw_tier}/plot.png)\n"),
+        )
+        .unwrap();
+
+        let mut args = base_args(input);
+        args.output = Some(tmp.join("out"));
+        let report = execute(&args, Direction::MystToQuarto).unwrap();
+
+        assert!(report.has_failures());
+        assert!(report
+            .warnings
+            .iter()
+            .any(|d| d.code == codes::io::DENIED_REFERENCE && d.severity == Severity::Error));
+        assert!(!tmp.join("out").join(&raw_tier).exists());
+
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn a_single_file_the_project_names_converts_the_project_closure() {
+        let tmp = tempdir("single-in-project");
+        let input = input_dir(&tmp);
+        fs::write(
+            input.join("_quarto.yml"),
+            "project:\n  type: manuscript\nmanuscript:\n  article: index.qmd\n",
+        )
+        .unwrap();
+        fs::write(input.join("index.qmd"), "# Hi\n\n![F](img/f.png)\n").unwrap();
+        fs::create_dir_all(input.join("img")).unwrap();
+        fs::write(input.join("img/f.png"), "png").unwrap();
+        fs::write(input.join("notes.qmd"), "# Not part of it\n").unwrap();
+
+        let mut args = base_args(input.join("index.qmd"));
+        args.output = Some(tmp.join("out"));
+        let report = execute(&args, Direction::QuartoToMyst).unwrap();
+        assert!(!report.has_failures(), "{:?}", report.outcomes);
+        assert!(tmp.join("out/index.md").exists());
+        assert!(tmp.join("out/img/f.png").exists());
+        assert!(tmp.join("out/myst.yml").exists());
+        assert!(!tmp.join("out/notes.md").exists());
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.code == codes::config::SINGLE_FILE_IN_PROJECT));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.code == codes::config::CONFIG_RESTORED_FROM_SNAPSHOT
+                || w.code == codes::config::MANUSCRIPT_ARTICLE_RESTORED));
+
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn a_single_file_outside_any_config_gets_a_synthesized_config() {
+        let tmp = tempdir("single-synth");
+        let input = input_dir(&tmp);
+        fs::create_dir_all(input.join("doc")).unwrap();
+        fs::write(input.join("doc/page.md"), "# Page\n").unwrap();
+
+        let mut args = base_args(input.join("doc/page.md"));
+        args.output = Some(tmp.join("out"));
         let report = execute(&args, Direction::MystToQuarto).unwrap();
         assert!(!report.has_failures(), "{:?}", report.outcomes);
-
-        // The source notebook must be byte-identical — never relabelled.
         assert_eq!(
-            fs::read_to_string(tmp.join("analysis.ipynb")).unwrap(),
-            notebook_source
+            fs::read_to_string(tmp.join("out/_quarto.yml")).unwrap(),
+            "project:\n  type: default\n  render:\n    - page.qmd\n"
         );
-        // No sidecar written into the source tree.
-        assert!(!tmp.join(".mystquarto").join("labels.json").exists());
-        // The skip is surfaced, not silent.
-        assert!(
-            report
-                .warnings
-                .iter()
-                .any(|w| w.message.contains("output writes into the input tree")),
-            "{:?}",
-            report.warnings
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.code == codes::config::CONFIG_SYNTHESIZED));
+
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn a_gitignored_output_inside_the_input_is_allowed() {
+        let tmp = tempdir("gitignored-output");
+        write_myst_project(&tmp);
+        fs::write(tmp.join(".gitignore"), "_build/\n").unwrap();
+
+        let mut args = base_args(tmp.clone());
+        args.output = Some(tmp.join("_build/quarto"));
+        let report = execute(&args, Direction::MystToQuarto).unwrap();
+        assert!(!report.has_failures(), "{:?}", report.outcomes);
+        assert!(tmp.join("_build/quarto/intro.qmd").exists());
+
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn a_missing_output_is_an_error_that_suggests_a_path() {
+        let tmp = tempdir("no-output");
+        write_myst_project(&tmp);
+        let err =
+            execute(&base_args(tmp.clone()), Direction::MystToQuarto).expect_err("-o is required");
+        let text = format!("{err}");
+        assert!(text.contains("-o/--output is required"), "{text}");
+        assert!(text.contains("mktemp -d"), "{text}");
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn in_place_is_refused_in_an_agent_science_kit_project() {
+        let tmp = tempdir("in-place-ask");
+        write_myst_project(&tmp);
+        fs::create_dir_all(tmp.join(".ask")).unwrap();
+        let mut args = base_args(tmp.clone());
+        args.in_place = true;
+        args.force = true;
+        let err = execute(&args, Direction::MystToQuarto).expect_err("must refuse");
+        assert!(format!("{err}").contains(".ask"), "{err}");
+        assert!(tmp.join("intro.md").exists());
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn an_existing_project_is_refused_as_output_even_with_force() {
+        let tmp = tempdir("existing-project-output");
+        let input = input_dir(&tmp);
+        write_myst_project(&input);
+        let existing = tmp.join("ask-repo");
+        fs::create_dir_all(existing.join(".ask")).unwrap();
+        fs::write(existing.join("_quarto.yml"), "hand: authored\n").unwrap();
+
+        for force in [false, true] {
+            let mut args = base_args(input.clone());
+            args.output = Some(existing.clone());
+            args.force = force;
+            let err = execute(&args, Direction::MystToQuarto).expect_err("must refuse");
+            assert!(
+                format!("{err}").contains(codes::io::OUTPUT_DIR_REFUSED),
+                "{err}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(existing.join("_quarto.yml")).unwrap(),
+            "hand: authored\n"
         );
+        assert!(!existing.join("intro.qmd").exists());
+
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn a_previous_output_of_the_same_direction_is_reused_but_not_of_the_other() {
+        let tmp = tempdir("previous-output");
+        let input = input_dir(&tmp);
+        write_myst_project(&input);
+        let output = tmp.join("out");
+
+        let mut args = base_args(input.clone());
+        args.output = Some(output.clone());
+        execute(&args, Direction::MystToQuarto).unwrap();
+        let again = execute(&args, Direction::MystToQuarto).unwrap();
+        assert!(!again.has_failures(), "{:?}", again.outcomes);
+        assert_eq!(again.config_conflict, None);
+
+        fs::write(input.join("_quarto.yml"), "project:\n  type: default\n").unwrap();
+        let err = execute(&args, Direction::QuartoToMyst).expect_err("other direction");
+        assert!(format!("{err}").contains("to-quarto"), "{err}");
 
         cleanup(&tmp);
     }
@@ -1624,49 +2244,134 @@ mod tests {
     }
 
     #[test]
-    fn config_overwrite_without_force_reports_a_conflict_and_does_not_touch_the_existing_file() {
-        let tmp = tempdir("config-conflict");
-        write_myst_project(&tmp);
+    fn a_config_write_failure_is_a_failed_outcome_and_a_non_zero_exit() {
+        let tmp = tempdir("config-write-fails");
+        let input = input_dir(&tmp);
+        write_myst_project(&input);
         let output_dir = tmp.join("out");
-        fs::create_dir_all(&output_dir).unwrap();
-        let existing = output_dir.join("_quarto.yml");
-        fs::write(&existing, "hand: authored\n").unwrap();
+        // A directory where the config file must go makes the write fail
+        // while every content file still converts. The marker makes the
+        // directory this tool's own previous output, so it is not refused.
+        fs::create_dir_all(output_dir.join("_quarto.yml")).unwrap();
+        write_output_marker(&output_dir, Direction::MystToQuarto).unwrap();
 
-        let mut args = base_args(tmp.clone());
-        args.output = Some(output_dir.clone());
+        let mut args = base_args(input);
+        args.output = Some(output_dir);
         let report = execute(&args, Direction::MystToQuarto).unwrap();
 
-        assert_eq!(
-            report.config_conflict,
-            Some(output_dir.join("_quarto.yml.new"))
-        );
-        assert_eq!(fs::read_to_string(&existing).unwrap(), "hand: authored\n");
-        // `.new` is a *reported* conflict path, never an actually written
-        // file — see `RunReport::config_conflict`'s docs.
-        assert!(!output_dir.join("_quarto.yml.new").exists());
         assert!(report.has_failures());
+        assert!(report
+            .outcomes
+            .iter()
+            .any(|o| o.input.ends_with("myst.yml") && matches!(o.status, FileStatus::Failed(_))));
+        assert_eq!(report.converted_count(), 2, "{:?}", report.outcomes);
 
         cleanup(&tmp);
     }
 
     #[test]
-    fn config_overwrite_with_force_does_not_report_a_conflict() {
-        let tmp = tempdir("config-force");
-        write_myst_project(&tmp);
-        let output_dir = tmp.join("out");
-        fs::create_dir_all(&output_dir).unwrap();
-        let existing = output_dir.join("_quarto.yml");
-        fs::write(&existing, "hand: authored\n").unwrap();
+    fn a_stale_target_config_in_the_input_is_ignored_and_kept() {
+        let tmp = tempdir("stale-target-config");
+        let input = tmp.join("in");
+        fs::create_dir_all(&input).unwrap();
+        fs::write(
+            input.join("_quarto.yml"),
+            "project:\n  type: manuscript\nmanuscript:\n  article: index.qmd\n",
+        )
+        .unwrap();
+        fs::write(
+            input.join("myst.yml"),
+            "version: 1\nproject:\n  title: STALE\n",
+        )
+        .unwrap();
+        fs::write(input.join("index.qmd"), "# Hello\n").unwrap();
+
+        let mut args = base_args(input.clone());
+        args.output = Some(tmp.join("out"));
+        let report = execute(&args, Direction::QuartoToMyst).unwrap();
+
+        assert!(!report.has_failures(), "{:?}", report.outcomes);
+        let myst = fs::read_to_string(tmp.join("out/myst.yml")).unwrap();
+        assert!(!myst.contains("STALE"), "the stale config leaked:\n{myst}");
+        assert!(myst.contains("index.md"), "{myst}");
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.code == codes::config::TARGET_CONFIG_IN_INPUT_IGNORED));
+        let sidecar = preserve::read(&tmp.join("out/.mystquarto/preserved.json")).unwrap();
+        assert_eq!(sidecar.ignored_config.unwrap().name, "myst.yml");
+
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn a_config_round_trip_restores_the_original_text_exactly() {
+        let tmp = tempdir("config-round-trip");
+        let src = tmp.join("src");
+        fs::create_dir_all(&src).unwrap();
+        let original = "# comment kept\nproject:\n  type: manuscript\n  output-dir: _build/quarto\n  render:\n    - index.qmd\nmanuscript:\n  article: index.qmd\n  code-links:\n    - text: Code\n      href: https://example.org/r\nexecute:\n  freeze: auto\nformat:\n  html:\n    toc: true\n";
+        fs::write(src.join("_quarto.yml"), original).unwrap();
+        fs::write(src.join("index.qmd"), "# Hello\n").unwrap();
+
+        let mut to_myst = base_args(src);
+        to_myst.output = Some(tmp.join("myst"));
+        assert!(!execute(&to_myst, Direction::QuartoToMyst)
+            .unwrap()
+            .has_failures());
+        let mut back = base_args(tmp.join("myst"));
+        back.output = Some(tmp.join("back"));
+        let report = execute(&back, Direction::MystToQuarto).unwrap();
+        assert!(!report.has_failures(), "{:?}", report.outcomes);
+
+        assert_eq!(
+            fs::read_to_string(tmp.join("back/_quarto.yml")).unwrap(),
+            original
+        );
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.code == codes::config::CONFIG_RESTORED_FROM_SNAPSHOT));
+
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn citations_defined_in_a_project_or_page_bibliography_are_not_reported_missing() {
+        let tmp = tempdir("bib-reachability");
+        fs::create_dir_all(tmp.join("literature")).unwrap();
+        fs::create_dir_all(tmp.join("manuscript")).unwrap();
+        fs::write(
+            tmp.join("literature/references.bib"),
+            "@article{smith2020,\n  title = {A}\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("literature/extra.bib"),
+            "@book{doe2021,\n  title = {B}\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("myst.yml"),
+            "version: 1\nproject:\n  bibliography:\n    - literature/references.bib\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("manuscript/index.md"),
+            "---\nbibliography: ../literature/extra.bib\n---\n\nSee [@smith2020] and [@doe2021] and [@ghost2000].\n",
+        )
+        .unwrap();
 
         let mut args = base_args(tmp.clone());
-        args.output = Some(output_dir.clone());
-        args.force = true;
+        args.output = Some(tmp.with_extension("out"));
         let report = execute(&args, Direction::MystToQuarto).unwrap();
-
-        assert_eq!(report.config_conflict, None);
-        // --force allows the overwrite, and the write is now a real,
-        // converted `_quarto.yml` — not the hand-authored placeholder.
-        assert_eq!(fs::read_to_string(&existing).unwrap(), "title: Test\n");
+        cleanup(&tmp.with_extension("out"));
+        let missing: Vec<_> = report
+            .warnings
+            .iter()
+            .filter(|w| w.code == codes::bibliography::CITATION_KEY_MISSING)
+            .collect();
+        assert_eq!(missing.len(), 1, "{missing:?}");
+        assert!(missing[0].message.contains("ghost2000"), "{missing:?}");
 
         cleanup(&tmp);
     }
@@ -1680,10 +2385,11 @@ mod tests {
             (true, false, false),
         ] {
             let tmp = tempdir("dry-run-zero-bytes");
-            write_myst_project(&tmp);
+            let input = input_dir(&tmp);
+            write_myst_project(&input);
             let before = snapshot(&tmp);
 
-            let mut args = base_args(tmp.clone());
+            let mut args = base_args(input);
             args.dry_run = true;
             args.in_place = in_place;
             args.config_only = config_only;

@@ -1,0 +1,9 @@
+# Files a to-myst run on this fixture may write. A trailing `/` allows
+# anything under that directory; every other line must exist exactly.
+myst.yml
+index.md
+manuscript/sections/_intro.md
+images/fig1.png
+images/banner.png
+literature/references.bib
+.mystquarto/

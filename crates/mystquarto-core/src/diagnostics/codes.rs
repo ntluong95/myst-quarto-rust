@@ -107,7 +107,8 @@ pub mod config {
     /// Severity: Warning.
     pub const FORMAT_PASSED_THROUGH: &str = "MQ0408";
     /// A root-level `_quarto.yml` key has no myst.yml equivalent at all
-    /// (e.g. `execute:`, `csl:`); dropped. Severity: Warning.
+    /// (e.g. `execute:`, `csl:`); kept in the config snapshot and restored
+    /// when converting back. Severity: LossyExpected.
     pub const UNRECOGNIZED_TOP_LEVEL_KEY_DROPPED: &str = "MQ0409";
     /// A page-frontmatter field has no correct target in the other dialect
     /// (`label`, `math`); dropped rather than mismapped. Severity:
@@ -145,6 +146,22 @@ pub mod config {
     /// signal for which document is the manuscript's main page. Severity:
     /// Info.
     pub const MANUSCRIPT_ARTICLE_RESTORED: &str = "MQ0414";
+    /// The input carried the *target* dialect's config too (a stale
+    /// `myst.yml` next to `_quarto.yml`); it was ignored in favour of
+    /// converting the source config, and its text was kept in
+    /// `.mystquarto/preserved.json`. Severity: Info.
+    pub const TARGET_CONFIG_IN_INPUT_IGNORED: &str = "MQ0415";
+    /// The target config was restored from the snapshot a previous
+    /// conversion recorded, verbatim or with the user's edits merged in.
+    /// Severity: Info.
+    pub const CONFIG_RESTORED_FROM_SNAPSHOT: &str = "MQ0416";
+    /// A single file was converted from inside a project that has its own
+    /// config; converting the project root is usually what the user
+    /// wants. Severity: Info.
+    pub const SINGLE_FILE_IN_PROJECT: &str = "MQ0417";
+    /// A single-file run wrote a minimal target config naming the file,
+    /// so the output builds on its own. Severity: Info.
+    pub const CONFIG_SYNTHESIZED: &str = "MQ0418";
 }
 
 /// MQ06xx — file, IO, path safety, discovery.
@@ -166,4 +183,16 @@ pub mod io {
     /// A path-safety check refused an include or embed target (escapes root,
     /// include cycle, depth exceeded, or absolute target). Severity: Warning.
     pub const PATH_SAFETY_REFUSED: &str = "MQ0605";
+    /// The manuscript closure references a file in a governed location
+    /// (raw data, original literature, `.ask/`, `.git/`, `.env*`). The file
+    /// is never read or copied, and the run fails. Severity: Error.
+    pub const DENIED_REFERENCE: &str = "MQ0606";
+    /// The manuscript closure references a gitignored file (or one in a
+    /// build/cache folder); it was not copied. Severity: Warning.
+    pub const CLOSURE_FILE_IGNORED: &str = "MQ0607";
+    /// The output directory was refused before anything was written: it
+    /// exists and is neither empty nor this tool's own previous output of
+    /// the same direction, or it sits inside the input and is not
+    /// gitignored. Reported as the run's error message. Severity: Error.
+    pub const OUTPUT_DIR_REFUSED: &str = "MQ0608";
 }

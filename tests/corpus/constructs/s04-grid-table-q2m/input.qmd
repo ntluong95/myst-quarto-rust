@@ -1,0 +1,10 @@
+<!-- mystquarto-roundtrip: normalized -->
++------+------------------+
+| Name | Notes            |
++======+==================+
+| x    | first line       |
+|      |                  |
+|      | second paragraph |
++------+------------------+
+
+: Notes {#tbl-notes}

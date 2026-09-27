@@ -18,7 +18,7 @@ cargo install mystquarto
 Or without a local install:
 
 ```bash
-npx mystquarto to-quarto docs/
+npx mystquarto to-quarto docs/ -o /tmp/docs-quarto
 ```
 
 Or grab a prebuilt binary for macOS (arm64/x64), Linux (x64/arm64/musl), or
@@ -34,16 +34,23 @@ myst2quarto docs/ -o docs-quarto/
 quarto2myst docs/ -o docs-myst/
 
 # Unified CLI
-mystquarto to-quarto docs/
-mystquarto to-myst docs/
+mystquarto to-quarto docs/ -o docs-quarto/
+mystquarto to-myst docs/ -o docs-myst/
 ```
+
+`-o` is required. The output directory must not exist yet, or be empty, or
+hold this tool's own previous output of the same direction. It may sit inside
+the project only if it is gitignored (for example `_build/myst`). An existing
+project is always refused, even with `--force`: a conversion never merges
+into one, so you move the files you want by hand.
 
 ### Options
 
 | Flag | Description |
 |---|---|
-| `-o DIR` / `--output DIR` | Output directory (default: `<input>-quarto/` or `<input>-myst/`) |
-| `--in-place` | Modify files in-place (requires `--force`, refuses on a dirty VCS state) |
+| `-o DIR` / `--output DIR` | Output directory (required unless `--in-place`; see above) |
+| `--scope manuscript\|all` | `manuscript` (default) reads only what the project config reaches; `all` walks the whole folder (see below) |
+| `--in-place` | Modify files in-place (requires `--force`, refuses on a dirty VCS state, and in an agent-science-kit project) |
 | `--force` | Bypass the `--in-place` overwrite and clean-VCS-state gates |
 | `--config-only` | Only convert config files (`myst.yml` ↔ `_quarto.yml`) |
 | `--no-config` | Skip config file conversion |
@@ -57,31 +64,82 @@ silently dropped: unmappable constructs are preserved verbatim in
 renames are tracked in `.mystquarto/labels.json` so `fig:samples` ↔
 `fig-samples` round-trips.
 
+### Which files are read
+
+With a project config (`_quarto.yml` / `myst.yml`), a conversion reads only
+the manuscript's **closure**. That means the files the config names
+(`manuscript.article`, `project.render`, `book.chapters`, `project.toc`,
+export articles, resources, bibliography), plus everything those files
+reach: includes, embeds, figures and images, links to other documents, and
+frontmatter bibliographies. Nothing else in the folder is read or copied.
+Without a config, the whole folder is walked, skipping agent and tooling
+files (`AGENTS.md`, `CLAUDE.md`, `README.md`, `CHANGELOG.md`, `plans/`).
+`--scope all` walks the whole folder even when a config exists.
+
+In every mode, `.gitignore` is honoured, and these locations are **never**
+read or copied, even when the manuscript references them:
+
+- the raw-data tier `data/raw/` and original literature `literature/og/`
+- `.ask/`, `.git/`, and `.env*` files
+
+A reference into one of them is error MQ0606 and fails the run.
+
+### Using with agent-science-kit
+
+In an [agent-science-kit](https://github.com/ntluong95/agent-science-kit)
+project, Quarto is the only source. A MyST version is a disposable preview
+built outside the project, so nothing is written into it:
+
+```bash
+tmp="$(mktemp -d)"
+mystquarto to-myst . -o "$tmp/myst"
+(cd "$tmp/myst" && myst start)
+```
+
+To bring an existing MyST project into an ASK project, convert it into a new
+directory and move the manuscript files across by hand:
+
+```bash
+mystquarto to-quarto path/to/myst-project -o "$(mktemp -d)/imported"
+```
+
+The full recipe, including a static HTML copy, is in ASK's
+`skills/ask-quarto-manuscript/references/render-and-troubleshoot.md`.
+
 ## What it converts
 
 ### Block directives
 
 | MyST | Quarto |
 |---|---|
-| `` ```{code-cell} python `` | `` ```{python} `` |
+| `` ```{code-cell} python `` + `#\| label:` / `#\| caption:` | `` ```{python} `` + `#\| label:` / `#\| fig-cap:` |
 | `:tags: [remove-input]` | `#\| echo: false` |
 | `:tags: [remove-output]` | `#\| output: false` |
 | `:tags: [remove-cell]` | `#\| include: false` |
 | `:tags: [hide-input]` | `#\| code-fold: true` |
-| `` ```{figure} path `` | `![caption](path){#fig-id width=X}` |
+| `:::{figure} path` | `![caption](path){#fig-id width=X}` |
+| `:::{figure}` holding nested figures | `::: {#fig-id layout-ncol=N}` holding images |
 | `` ```{math} `` + `:label:` | `$$ ... $$ {#eq-id}` |
-| `` ```{note} `` | `::: {.callout-note}` |
-| `` ```{warning} `` | `::: {.callout-warning}` |
-| `` ```{tip} `` | `::: {.callout-tip}` |
-| `` ```{important} `` | `::: {.callout-important}` |
-| `` ```{admonition} Title `` | `::: {.callout-note title="Title"}` |
+| `:::{note}` / `{warning}` / `{tip}` / `{important}` / `{caution}` | `::: {.callout-*}` |
+| `:::{warning} Title` | `::: {.callout-warning title="Title"}` |
+| `:::{admonition} Title` + `:class: tip` | `::: {.callout-tip title="Title"}` |
+| `:::{seealso}`, `{hint}`, `{danger}`, … | Nearest callout plus the kind as a class (`.callout-note .seealso`) |
+| `:::{dropdown} Title` | `::: {.callout-note .dropdown collapse="true" title="Title"}` |
+| `:class: dropdown` (+ `:open:`) | `collapse="true"` (`"false"`) |
 | `::::{tab-set}` / `:::{tab-item}` | `::: {.panel-tabset}` / `## Label` |
-| `` ```{margin} `` | `::: {.column-margin}` |
+| `:::{margin}` / `{aside}` | `::: {.column-margin}` |
+| `::::{grid} N` / `:::{card} Title` | `::: {.grid}` / `::: {.card .g-col-12 .g-col-md-(12/N)}` with a `**Title**` line |
+| `:::{epigraph}` / `{pull-quote}` | `::: {.epigraph}` around a `>` quote |
+| `` ```{list-table} Caption `` | Pipe table (grid table for multi-line cells) + `: Caption {#tbl-id}` |
+| `:::{table} Caption` | Markdown table + `: Caption {#tbl-id}` |
+| `` ```{code-block} lang `` + `:linenos:` / `:emphasize-lines:` / `:caption:` | `` ```{.lang code-line-numbers="…" filename="…"} `` |
 | `` ```{image} url `` | `![alt](url){width=X}` |
-| `` ```{table} Caption `` | Markdown table + `: Caption {#tbl-id}` |
-| `` ```{bibliography} `` | Removed (Quarto handles via config) |
-| `` ```{tableofcontents} `` | Removed (Quarto handles via config) |
-| `` ```{mermaid} `` | Pass through (both support it) |
+| `` ```{bibliography} `` / `{tableofcontents}` | Removed (Quarto handles both via config) |
+| `` ```{mermaid} `` | `` ```{mermaid} `` |
+
+A construct with no equivalent (for example `{glossary}`) is never dropped.
+It stays visible as a literal code block of its original source, and it is
+restored exactly on the reverse conversion.
 
 ### Inline roles
 
@@ -92,10 +150,13 @@ renames are tracked in `.mystquarto/labels.json` so `fig:samples` ↔
 | `` {cite:t}`key` `` | `@key` |
 | `` {cite:p}`key` `` | `[@key]` |
 | `` {cite}`a,b,c` `` | `[@a; @b; @c]` |
-| `` {numref}`fig-id` `` | `@fig-id` |
-| `` {ref}`label` `` | `@label` |
+| `` {numref}`fig-id` `` / `` {ref}`label` `` / `[](#label)` | `@label` (a link to the other page for a label defined elsewhere, outside Quarto books) |
 | `` {eq}`label` `` | `@eq-label` |
-| `` {doc}`path` `` | `[path](path.qmd)` |
+| `` {doc}`path` `` / `[text](path.md)` | `[path](path.qmd)` / `[text](path.qmd)` |
+| `` {math}`x` `` | `$x$` |
+| `` {sub}`x` `` / `` {sup}`x` `` | `~x~` / `^x^` |
+| `` {kbd}`Ctrl` `` | `[Ctrl]{.kbd}` |
+| `` {abbr}`CI (confidence interval)` `` | `<abbr title="confidence interval">CI</abbr>` |
 
 ### Config files (`myst.yml` ↔ `_quarto.yml`)
 

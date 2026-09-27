@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 pub use normalize::RefKind;
 
 use crate::diagnostics::{codes, Diagnostic, Severity};
+use crate::FigureSource;
 use crate::{Block, BlockKind, Document, Label};
 
 /// One entry collected from a document before normalization: which file it
@@ -192,9 +193,14 @@ fn collect_labels(blocks: &[Block], source: &Path, out: &mut Vec<RawLabel>) {
             BlockKind::Heading {
                 label: Some(label), ..
             } => push(out, source, label, RefKind::Section),
-            BlockKind::Figure {
-                label: Some(label), ..
-            } => push(out, source, label, RefKind::Figure),
+            BlockKind::Figure { label, src, .. } => {
+                if let Some(label) = label {
+                    push(out, source, label, RefKind::Figure);
+                }
+                if let FigureSource::Panel(subfigures) = src {
+                    collect_labels(subfigures, source, out);
+                }
+            }
             BlockKind::Table {
                 label: Some(label), ..
             } => push(out, source, label, RefKind::Table),

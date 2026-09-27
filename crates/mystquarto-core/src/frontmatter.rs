@@ -35,7 +35,7 @@ pub fn myst_to_quarto(fm: &Frontmatter) -> (String, Vec<Diagnostic>) {
     let crate::yaml::YamlValue::Mapping(parsed) = &fm.parsed else {
         return (fm.raw.clone(), Vec::new());
     };
-    let mut edits = Vec::new();
+    let mut edits = authors_to_quarto(parsed);
     let mut warnings = Vec::new();
 
     if let Some(kernelspec) = get(parsed, "kernelspec").and_then(|v| match v {
@@ -192,7 +192,7 @@ pub fn quarto_to_myst(
     let crate::yaml::YamlValue::Mapping(parsed) = &fm.parsed else {
         return (fm.raw.clone(), Vec::new());
     };
-    let mut edits = Vec::new();
+    let mut edits = authors_to_myst(parsed);
     let mut warnings = Vec::new();
 
     if let Some(name) = get(parsed, "jupyter").and_then(as_str) {
@@ -285,6 +285,170 @@ pub fn quarto_to_myst(
 /// (`frontmatter.py::quarto_to_myst_frontmatter`): `python3` -> `Python 3`,
 /// `ir` -> `R`, anything else uses the kernel name itself as a fallback
 /// display name.
+/// Quarto `author` -> MyST `authors`. Affiliations named inside an author
+/// become ids pointing into a top-level `affiliations` list, which is where
+/// MyST expects them (reference §8.2 / S14).
+fn authors_to_myst(parsed: &[(String, YamlValue)]) -> Vec<FrontmatterEdit> {
+    let Some(author) = get(parsed, "author") else {
+        return Vec::new();
+    };
+    let mut edits = vec![FrontmatterEdit::Rename {
+        from: "author".to_string(),
+        to: "authors".to_string(),
+    }];
+    let YamlValue::Sequence(list) = author else {
+        return edits;
+    };
+    let mut affiliations: Vec<(String, YamlValue)> = Vec::new();
+    let mut id_for = |aff: &YamlValue| -> Option<String> {
+        let (name, fields) = match aff {
+            YamlValue::String(n) => (n.clone(), vec![("name".to_string(), aff.clone())]),
+            YamlValue::Mapping(m) => (
+                string_field(m, "name")?,
+                m.iter().filter(|(k, _)| k != "id").cloned().collect(),
+            ),
+            _ => return None,
+        };
+        if let Some((id, _)) = affiliations.iter().find(|(_, v)| {
+            matches!(v, YamlValue::Mapping(m) if string_field(m, "name").as_deref() == Some(name.as_str()))
+        }) {
+            return Some(id.clone());
+        }
+        let base = slug(&name);
+        let mut id = base.clone();
+        let mut n = 2;
+        while affiliations.iter().any(|(i, _)| *i == id) {
+            id = format!("{base}-{n}");
+            n += 1;
+        }
+        let mut entry = vec![("id".to_string(), YamlValue::String(id.clone()))];
+        entry.extend(fields);
+        affiliations.push((id.clone(), YamlValue::Mapping(entry)));
+        Some(id)
+    };
+    let mut changed = false;
+    let authors: Vec<YamlValue> = list
+        .iter()
+        .map(|a| match a {
+            YamlValue::Mapping(m) => YamlValue::Mapping(
+                m.iter()
+                    .map(|(k, v)| match (k.as_str(), v) {
+                        ("affiliations" | "affiliation", YamlValue::Sequence(affs)) => {
+                            changed = true;
+                            let ids = affs
+                                .iter()
+                                .map(|x| id_for(x).map_or_else(|| x.clone(), YamlValue::String))
+                                .collect();
+                            ("affiliations".to_string(), YamlValue::Sequence(ids))
+                        }
+                        (
+                            "affiliations" | "affiliation",
+                            single @ (YamlValue::String(_) | YamlValue::Mapping(_)),
+                        ) => {
+                            changed = true;
+                            let id =
+                                id_for(single).map_or_else(|| single.clone(), YamlValue::String);
+                            ("affiliations".to_string(), YamlValue::Sequence(vec![id]))
+                        }
+                        _ => (k.clone(), v.clone()),
+                    })
+                    .collect(),
+            ),
+            other => other.clone(),
+        })
+        .collect();
+    if changed && get(parsed, "affiliations").is_none() {
+        edits.push(FrontmatterEdit::Set {
+            key: "authors".to_string(),
+            value: YamlValue::Sequence(authors),
+        });
+        edits.push(FrontmatterEdit::Set {
+            key: "affiliations".to_string(),
+            value: YamlValue::Sequence(affiliations.into_iter().map(|(_, v)| v).collect()),
+        });
+    }
+    edits
+}
+
+/// MyST `authors` -> Quarto `author`, with affiliation ids replaced by the
+/// top-level `affiliations` they point to: just the name when that is all
+/// the affiliation holds, else the whole entry without its id.
+fn authors_to_quarto(parsed: &[(String, YamlValue)]) -> Vec<FrontmatterEdit> {
+    let Some(authors) = get(parsed, "authors") else {
+        return Vec::new();
+    };
+    let mut edits = vec![FrontmatterEdit::Rename {
+        from: "authors".to_string(),
+        to: "author".to_string(),
+    }];
+    let (YamlValue::Sequence(list), Some(YamlValue::Sequence(affs))) =
+        (authors, get(parsed, "affiliations"))
+    else {
+        return edits;
+    };
+    let lookup = |id: &str| -> Option<YamlValue> {
+        affs.iter().find_map(|a| match a {
+            YamlValue::Mapping(m) if string_field(m, "id").as_deref() == Some(id) => {
+                let rest: Vec<(String, YamlValue)> =
+                    m.iter().filter(|(k, _)| k != "id").cloned().collect();
+                Some(match rest.as_slice() {
+                    [(k, v @ YamlValue::String(_))] if k == "name" => v.clone(),
+                    _ => YamlValue::Mapping(rest),
+                })
+            }
+            _ => None,
+        })
+    };
+    let author: Vec<YamlValue> = list
+        .iter()
+        .map(|a| match a {
+            YamlValue::Mapping(m) => YamlValue::Mapping(
+                m.iter()
+                    .map(|(k, v)| match (k.as_str(), v) {
+                        ("affiliations", YamlValue::Sequence(ids)) => (
+                            k.clone(),
+                            YamlValue::Sequence(
+                                ids.iter()
+                                    .map(|x| match x {
+                                        YamlValue::String(id) => {
+                                            lookup(id).unwrap_or_else(|| x.clone())
+                                        }
+                                        _ => x.clone(),
+                                    })
+                                    .collect(),
+                            ),
+                        ),
+                        _ => (k.clone(), v.clone()),
+                    })
+                    .collect(),
+            ),
+            other => other.clone(),
+        })
+        .collect();
+    edits.push(FrontmatterEdit::Set {
+        key: "author".to_string(),
+        value: YamlValue::Sequence(author),
+    });
+    edits.push(FrontmatterEdit::Remove {
+        key: "affiliations".to_string(),
+    });
+    edits
+}
+
+fn slug(name: &str) -> String {
+    let s: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let s = s.trim_matches('-').to_string();
+    if s.is_empty() {
+        "affiliation".to_string()
+    } else {
+        s
+    }
+}
+
 fn kernelspec_for(name: &str) -> YamlValue {
     let display_name = match name {
         "python3" => "Python 3".to_string(),
@@ -300,6 +464,29 @@ fn kernelspec_for(name: &str) -> YamlValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quarto_author_affiliations_become_myst_ids_and_back() {
+        let quarto = "title: T\nauthor:\n  - name: Jane Smith\n    affiliations: [Uni]\n  - name: Bo\n    affiliations:\n      - Uni\n      - name: Lab\n        city: Oslo\n";
+        let (myst, _) = quarto_to_myst(&fm(quarto), None);
+        assert!(myst.contains("authors:"), "{myst}");
+        assert!(!myst.contains("author:\n"), "{myst}");
+        let parsed = crate::yaml::parse_mapping(&myst).unwrap();
+        let YamlValue::Sequence(affs) = get(&parsed, "affiliations").unwrap() else {
+            panic!("{myst}")
+        };
+        assert_eq!(affs.len(), 2, "{myst}");
+        assert!(myst.contains("- uni"), "{myst}");
+
+        let (back, _) = myst_to_quarto(&fm(&myst));
+        let a = crate::yaml::parse_mapping(quarto).unwrap();
+        let b = crate::yaml::parse_mapping(&back).unwrap();
+        assert_eq!(
+            crate::config::snapshot::canonical(&YamlValue::Mapping(a)),
+            crate::config::snapshot::canonical(&YamlValue::Mapping(b)),
+            "{back}"
+        );
+    }
     use crate::yaml::parse_mapping;
 
     fn fm(raw: &str) -> Frontmatter {

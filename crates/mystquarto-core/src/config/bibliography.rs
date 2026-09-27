@@ -58,6 +58,42 @@ pub fn bib_defined_keys(bib_text: &str) -> BTreeSet<String> {
 /// [`scan_line`] (the same recognizer the writers use) so a key here is
 /// exactly what a writer would also treat as a citation, not an
 /// independently-reimplemented guess.
+/// The `bibliography:` entries of a config or frontmatter mapping, whether
+/// written as one string or a list.
+#[must_use]
+pub fn bibliography_entries(mapping: &[(String, crate::yaml::YamlValue)]) -> Vec<String> {
+    use crate::yaml::YamlValue;
+    match mapping
+        .iter()
+        .find(|(k, _)| k == "bibliography")
+        .map(|(_, v)| v)
+    {
+        Some(YamlValue::String(s)) => vec![s.clone()],
+        Some(YamlValue::Sequence(items)) => items
+            .iter()
+            .filter_map(|v| match v {
+                YamlValue::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The `bibliography:` entries of a content file's frontmatter. Paths are
+/// relative to that file's own directory. A file without (valid)
+/// frontmatter has none.
+#[must_use]
+pub fn frontmatter_bibliography_entries(text: &str) -> Vec<String> {
+    match crate::reader::split_frontmatter(text) {
+        Ok((Some(fm), _, _)) => match fm.parsed {
+            crate::yaml::YamlValue::Mapping(m) => bibliography_entries(&m),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
 #[must_use]
 pub fn citation_keys_in_document(doc: &Document, known_labels: &[String]) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
@@ -122,6 +158,21 @@ pub fn missing_citation_warnings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frontmatter_bibliography_reads_a_string_or_a_list() {
+        assert_eq!(
+            frontmatter_bibliography_entries(
+                "---\nbibliography: ../literature/references.bib\n---\n# H\n"
+            ),
+            vec!["../literature/references.bib".to_string()]
+        );
+        assert_eq!(
+            frontmatter_bibliography_entries("---\nbibliography:\n  - a.bib\n  - b.bib\n---\n"),
+            vec!["a.bib".to_string(), "b.bib".to_string()]
+        );
+        assert!(frontmatter_bibliography_entries("# no frontmatter\n").is_empty());
+    }
     use crate::ir::{Attrs, Engine, FigureSource};
     use crate::{Label, Span};
     use std::path::PathBuf;

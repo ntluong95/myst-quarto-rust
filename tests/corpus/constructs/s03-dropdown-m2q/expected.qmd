@@ -1,0 +1,7 @@
+::: {.callout-note .dropdown title="Click me" collapse="true"}
+Hidden content.
+:::
+
+::: {.callout-note collapse="true"}
+Collapsed note.
+:::

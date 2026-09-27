@@ -1,0 +1,12 @@
+version: 1
+project:
+  title: Native MyST probe
+  authors:
+    - name: Jane Smith
+  bibliography:
+    - references.bib
+  toc:
+    - file: index.md
+    - file: chapter.md
+site:
+  template: article-theme
