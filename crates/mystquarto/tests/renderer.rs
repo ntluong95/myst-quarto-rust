@@ -260,14 +260,21 @@ fn run_bounded(mut cmd: Command) -> (bool, String) {
     }
 }
 
+/// Copies regular files and directories only. `.git` is skipped (a render
+/// never needs it, and git may still be writing lock files there), and
+/// symlinks are never followed.
 fn copy_dir(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).unwrap();
     for entry in fs::read_dir(src).unwrap() {
         let entry = entry.unwrap();
+        if entry.file_name() == ".git" {
+            continue;
+        }
         let to = dst.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
+        let kind = entry.file_type().unwrap();
+        if kind.is_dir() {
             copy_dir(&entry.path(), &to);
-        } else {
+        } else if kind.is_file() {
             fs::copy(entry.path(), &to).unwrap();
         }
     }
@@ -284,6 +291,10 @@ fn git(dir: &Path, args: &[&str]) -> std::process::Output {
 fn git_init_commit(dir: &Path) {
     for args in [
         &["init", "-q"][..],
+        // No detached background maintenance: it creates and removes lock
+        // files in the repository while later steps copy this tree.
+        &["config", "maintenance.auto", "false"],
+        &["config", "gc.auto", "0"],
         &["config", "user.email", "e2e@example.org"],
         &["config", "user.name", "e2e"],
         &["add", "-A"],
