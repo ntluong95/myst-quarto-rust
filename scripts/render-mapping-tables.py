@@ -26,7 +26,7 @@ import tomllib
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-MAPPINGS_PATH = REPO_ROOT / "mappings.toml"
+MAPPINGS_PATH = REPO_ROOT / "crates" / "mystquarto-core" / "mappings.toml"
 DOC_PATH = REPO_ROOT / "docs" / "dialect-comparison.md"
 
 FIDELITY_SYMBOL = {"exact": "✅", "lossy": "⚠️", "unmappable": "❌"}

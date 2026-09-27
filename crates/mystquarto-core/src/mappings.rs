@@ -137,7 +137,7 @@ pub struct Mappings {
 }
 
 /// The raw `mappings.toml` source, embedded at compile time.
-pub const MAPPINGS_TOML: &str = include_str!("../../../mappings.toml");
+pub const MAPPINGS_TOML: &str = include_str!("../mappings.toml");
 
 static MAPPINGS: LazyLock<Mappings> = LazyLock::new(|| {
     toml::from_str(MAPPINGS_TOML).expect("mappings.toml must parse into Mappings")

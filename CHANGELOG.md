@@ -71,6 +71,7 @@ and mystmd 1.11.0 (`cargo test -p mystquarto --features renderer-tests`).
 - Constructs with no equivalent stay visible as a literal code block instead of disappearing into an HTML comment. They are still restored exactly on the reverse conversion.
 - A cross-document reference outside a Quarto book becomes a link to the other page instead of an unresolvable `@id`.
 - Blank lines no longer accumulate after frontmatter on every conversion.
+- The crates package for crates.io, so `cargo install mystquarto` works. `mappings.toml` moved into `crates/mystquarto-core/`; it previously sat outside the crate and blocked packaging.
 
 ## 0.2.0
 
