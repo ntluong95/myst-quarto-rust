@@ -1,7 +1,7 @@
 ---
 phase: 8
 title: agent-science-kit alignment
-status: in-progress
+status: done
 repo: agent-science-kit
 covers: ["§5 all rows", "decision 2"]
 ---
@@ -51,7 +51,7 @@ covers: ["§5 all rows", "decision 2"]
 - The preview recipe gives 0 ⛔ from `myst build --html` in temp, and `git status --porcelain` in the project is empty afterwards (apart from optional `_build/myst-html`, which is gitignored).
 - `grep -rn "pip install mystquarto\|uv tool install mystquarto\|_build/myst " skills README.md` finds nothing.
 
-## Result (so far)
+## Result
 
 Done on ASK branch `fix/mystquarto-0.3-alignment` (commit `a54e63c`, based on ASK `main` @ `159b0bb`). It was made in a separate worktree, so the user's in-progress `ntluong95/feat/statistical-methods-expansion` checkout and its uncommitted changes were never touched.
 
@@ -59,4 +59,4 @@ Done on ASK branch `fix/mystquarto-0.3-alignment` (commit `a54e63c`, based on AS
 - Validation: a project scaffolded from the updated template runs the documented recipe with 0 MyST errors and 0 warnings. The included section renders, the preview holds only the manuscript closure, and `git status --porcelain` stays empty (the static copy lands in gitignored `_build/myst-html/`). ASK's `manuscript-check` suite passes 105/105. `mystquarto --version` prints 0.3.0 on this Mac.
 - `manuscript-version-git.mjs` still whitelists `myst.yml` for commits. That is harmless for legacy projects, and left unchanged.
 
-**Step 5 needs a product decision.** Quarto 1.9.36 and 1.11.5 both fail on a `manuscript/index.qmd` article that has an executable cell (`readfile …/manuscript/manuscript/index.qmd`), and `execute-dir: project` does not help. Only root placement works, as the e2e ASK fixture shows. Moving the article to the root touches 17 ASK files, including `scripts/lib/structure.mjs` (which requires `manuscript/index.qmd`), its tests, and the docs of ask-journal-format and ask-litreview-deep. The alternative is to keep the layout, document that computation belongs in `manuscript.notebooks` + `{{< embed >}}` (Quarto's manuscript pattern), and report the bug upstream. Waiting on the user.
+**Step 5 (decided: root placement).** Quarto 1.9.36 and 1.11.5 fail on a `manuscript/index.qmd` article with an executable cell, and also with a notebook embed, under every path variant tried. The identical article renders from the root. ASK now keeps `index.qmd` at the root: the template, `ask-init`, and five skills' docs moved, and the CSL path became `manuscript/journal/style.csl`. `manuscript-check` finds the root article and still accepts the old location; its suite is 110/110 including five new tests. A project scaffolded from the new template renders an executable cell with 0 Quarto errors, and its MyST preview has 0 errors and 0 warnings. The limitation is documented in ASK issue #6 (not reported upstream, by the user's choice). The installer docs lead with the release installer until the crate is on crates.io. Merged as ASK PR #7.

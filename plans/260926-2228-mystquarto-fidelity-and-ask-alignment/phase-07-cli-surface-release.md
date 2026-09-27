@@ -1,7 +1,7 @@
 ---
 phase: 7
 title: CLI surface and release
-status: in-progress
+status: done
 repo: myst-quarto-rustCLI
 ---
 
@@ -26,4 +26,4 @@ repo: myst-quarto-rustCLI
 - Steps 1–4 are done. `--version` works on all three binaries (CLI test `every_binary_prints_its_version`). The version is 0.3.0. The CHANGELOG leads with the breaking changes. The README has the required `-o`, `--scope`, "Which files are read" (the denylist), and "Using with agent-science-kit" sections.
 - Step 2: `--no-label-map` was not actually inert. It already skips writing `labels.json`; only its doc comment said otherwise. The doc was fixed and the flag kept.
 - Step 6 (local): 0.3.0 installed into `~/.cargo/bin` from the branch, and the review's `/tmp/mq-*` scratch dirs deleted.
-- Step 5 (release through cargo-dist) is **pending the user's go-ahead**. It publishes a tag, GitHub release artifacts and the crates.io packages.
+- Step 5: released as v0.3.0 through cargo-dist after PRs #1 and #2 merged. All six platform builds and `mystquarto-installer.sh` are published, and the installer was verified to install 0.3.0 of all three binaries. PR #2 fixed a packaging bug: `mappings.toml` sat outside the core crate, so `cargo publish` had never worked and the crate was never on crates.io. **Still open:** `cargo publish --workspace` needs the user's crates.io token; until then `cargo install mystquarto` fails.
